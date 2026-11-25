@@ -420,6 +420,12 @@ func TestQuoteBatchArg(t *testing.T) {
 		// A quote is doubled — cmd's escape. ComposeCommandLine would emit \",
 		// which cmd does not honour, ending the quoted run early.
 		{`say "hi"`, `"say ""hi"""`},
+		// Backslashes are literal except before a quote (the CRT rule): such a
+		// run, and one before the closing quote, is doubled.
+		{`C:\foo\`, `"C:\foo\\"`},
+		{`a\"b`, `"a\\""b"`},
+		{`a\\"b`, `"a\\\\""b"`},
+		{`\\srv\share`, `"\\srv\share"`},
 	} {
 		got, err := quoteBatchArg(tc.in)
 		if err != nil {
@@ -429,7 +435,7 @@ func TestQuoteBatchArg(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("quoteBatchArg(%q) = %q, want %q", tc.in, got, tc.want)
 		}
-		if strings.Contains(got, `\"`) {
+		if !strings.Contains(tc.in, `\`) && strings.Contains(got, `\"`) {
 			t.Errorf("quoteBatchArg(%q) = %q: uses a backslash escape cmd.exe does not honour", tc.in, got)
 		}
 	}
@@ -977,11 +983,11 @@ func TestWindowsEnvBlock(t *testing.T) {
 		t.Fatalf("nil env = %v, %v; want a nil block (inherit)", p, err)
 	}
 
-	p, err := windowsEnvBlock([]string{"b=1", "A=2", "B=3", "noequals", `=C:=C:\x`, "ünï=4"})
+	p, err := windowsEnvBlock([]string{"b=1", "A=2", "B=3", "noequals", "A1=5", `=C:=C:\x`, "ünï=4"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{`=C:=C:\x`, "A=2", "B=3", `SYSTEMROOT=C:\Windows`, "ünï=4"}
+	want := []string{`=C:=C:\x`, "A=2", "A1=5", "B=3", `SYSTEMROOT=C:\Windows`, "ünï=4"}
 	if got := decodeEnvBlock(t, p); !slices.Equal(got, want) {
 		t.Fatalf("block = %q, want %q (deduped, SYSTEMROOT added, sorted)", got, want)
 	}
@@ -1054,5 +1060,15 @@ func TestPrepareCommandLeavesNativeImageAlone(t *testing.T) {
 	}
 	if cmd.Path != path || !slices.Equal(cmd.Args, args) || cmd.SysProcAttr != nil {
 		t.Fatalf("a native image was rewritten: %+v", cmd)
+	}
+}
+
+// A hand-built Cmd with no Args must be an error, not an index panic.
+func TestEmptyArgsIsAnErrorNotAPanic(t *testing.T) {
+	if _, err := Start(context.Background(), &exec.Cmd{Path: cmdExe}); err == nil {
+		t.Fatal("Start accepted a cmd with no Args")
+	}
+	if err := PrepareCommand(&exec.Cmd{Path: `C:\x\shim.cmd`}); err == nil {
+		t.Fatal("PrepareCommand accepted a batch cmd with no Args")
 	}
 }

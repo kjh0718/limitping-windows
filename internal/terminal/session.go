@@ -34,9 +34,10 @@ type Session interface {
 
 // Start launches cmd attached to a new pseudo-terminal and returns a Session
 // that owns the child's lifecycle. Cancelling ctx terminates the child, whether
-// cmd came from exec.Command or exec.CommandContext: ctx is what governs the
-// child, and cmd.Cancel / cmd.WaitDelay are not consulted. cmd must not have been
-// started.
+// cmd came from exec.Command or exec.CommandContext. On Unix pty.Start runs
+// cmd.Start, so a CommandContext's own Cancel applies as well; on Windows the
+// process is created by hand, cmd.Cancel and cmd.WaitDelay are never consulted,
+// and ctx alone kills the whole job. cmd must not have been started.
 //
 // Only Path, Args, Dir and Env of cmd are honoured (a nil Env inherits this
 // process's environment, as for os/exec). The PTY is the child's stdio and
@@ -48,6 +49,9 @@ type Session interface {
 func Start(ctx context.Context, cmd *exec.Cmd) (Session, error) {
 	if cmd.Err != nil {
 		return nil, cmd.Err
+	}
+	if cmd.Process != nil {
+		return nil, errors.New("terminal: cmd has already been started")
 	}
 	if cmd.Stdin != nil || cmd.Stdout != nil || cmd.Stderr != nil ||
 		len(cmd.ExtraFiles) != 0 || cmd.SysProcAttr != nil {

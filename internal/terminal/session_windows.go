@@ -198,6 +198,9 @@ func startAttached(cmd *exec.Cmd, envBlock *uint16, hpc windows.Handle, job *job
 // This matters here because the npm-installed CLIs this package drives are .cmd
 // shims on Windows, so the batch path is the common one, not the exotic one.
 func prepareWindowsCommand(cmd *exec.Cmd) (appName, cmdLine string, err error) {
+	if len(cmd.Args) == 0 {
+		return "", "", errors.New("terminal: cmd.Args is empty")
+	}
 	switch strings.ToLower(filepath.Ext(cmd.Path)) {
 	case ".cmd", ".bat":
 		return batchCommand(cmd.Path, cmd.Args[1:])
@@ -296,13 +299,27 @@ func quoteBatchArg(arg string) (string, error) {
 	var b strings.Builder
 	b.Grow(len(arg) + 2)
 	b.WriteByte('"')
+	// A CRT program (node, behind an npm shim's %*) reads backslashes back by its
+	// own rule: a run of them is literal unless a quote follows, where each pair
+	// collapses to one. So a run before a quote, or before the closing quote,
+	// is doubled; otherwise `C:\foo\` would swallow its closing quote and `a\"b`
+	// would lose the quote's escaping. cmd itself ignores backslashes.
+	backslashes := 0
 	for i := 0; i < len(arg); i++ {
-		if arg[i] == '"' {
+		switch c := arg[i]; c {
+		case '\\':
+			backslashes++
+			b.WriteByte(c)
+		case '"':
+			b.WriteString(strings.Repeat(`\`, backslashes))
 			b.WriteString(`""`)
-			continue
+			backslashes = 0
+		default:
+			backslashes = 0
+			b.WriteByte(c)
 		}
-		b.WriteByte(arg[i])
 	}
+	b.WriteString(strings.Repeat(`\`, backslashes))
 	b.WriteByte('"')
 	return b.String(), nil
 }
@@ -328,12 +345,12 @@ func windowsEnvBlock(env []string) (*uint16, error) {
 		if eq < 0 {
 			continue // no value: meaningless to CreateProcess
 		}
-		eq++ // index in kv, not in the slice
-		last[strings.ToUpper(kv[:eq+1])] = kv
+		eq++                                // index in kv, not in the slice
+		last[strings.ToUpper(kv[:eq])] = kv // keyed and sorted by name alone
 	}
-	if _, ok := last["SYSTEMROOT="]; !ok {
+	if _, ok := last["SYSTEMROOT"]; !ok {
 		if root := os.Getenv("SYSTEMROOT"); root != "" {
-			last["SYSTEMROOT="] = "SYSTEMROOT=" + root
+			last["SYSTEMROOT"] = "SYSTEMROOT=" + root
 		}
 	}
 	keys := make([]string, 0, len(last))
@@ -379,6 +396,9 @@ func prepareCommand(cmd *exec.Cmd) error {
 	case ".cmd", ".bat":
 	default:
 		return nil
+	}
+	if len(cmd.Args) == 0 {
+		return errors.New("terminal: cmd.Args is empty")
 	}
 	comspec, line, err := batchCommand(cmd.Path, cmd.Args[1:])
 	if err != nil {

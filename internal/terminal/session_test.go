@@ -44,3 +44,11 @@ func TestStartReturnsLookPathError(t *testing.T) {
 		t.Fatalf("Start = %v, want exec.ErrNotFound from cmd.Err", err)
 	}
 }
+
+func TestStartRejectsStartedCmd(t *testing.T) {
+	cmd := exec.Command(os.Args[0])
+	cmd.Process = &os.Process{}
+	if _, err := Start(context.Background(), cmd); err == nil || !strings.Contains(err.Error(), "already been started") {
+		t.Fatalf("Start = %v, want the already-started error", err)
+	}
+}
