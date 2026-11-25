@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"os/exec"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -51,13 +53,16 @@ const (
 	claudeTurnMaxWait    = 45 * time.Second
 	claudeExitGrace      = 5 * time.Second
 	claudePollInterval   = 200 * time.Millisecond
+	// claudeTranscriptWait bounds how long the ping waits for a killed session
+	// to exit before deleting its transcript.
+	claudeTranscriptWait = 5 * time.Second
 )
 
 var (
-	claudeUserAgentOnce sync.Once
-	claudeUserAgent     string
-	claudeANSIEscapeRE  = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
-	claudeNonTextRE     = regexp.MustCompile(`[^a-z0-9_]+`)
+	claudeVersionOnce  sync.Once
+	claudeVersion      string
+	claudeANSIEscapeRE = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
+	claudeNonTextRE    = regexp.MustCompile(`[^a-z0-9_]+`)
 )
 
 // ClaudeSubscriptionAccessError means Anthropic accepted the OAuth identity
@@ -78,7 +83,15 @@ func (e *ClaudeSubscriptionAccessError) Unwrap() error { return e.Err }
 // subscription limits.
 type Claude struct {
 	cfg  config.ProviderConfig
-	auth *auth.ClaudeAuth
+	auth tokenSource
+
+	redeemMu   sync.Mutex
+	lastRedeem time.Time // last automatic reset-card claim, for the cooldown
+	attempts   redeemAttempts
+
+	cardsMu     sync.Mutex
+	cards       *usage.ResetCredits // last reset cards read for auto_redeem
+	cardsReadAt time.Time           // when they were read; zero = never
 }
 
 func NewClaude(cfg config.ProviderConfig) *Claude {
@@ -87,14 +100,20 @@ func NewClaude(cfg config.ProviderConfig) *Claude {
 
 func (c *Claude) Name() string { return "claude" }
 
-func (c *Claude) ActiveTask(_ context.Context) (string, bool, error) {
-	// Active-session detection relies entirely on the CLI hooks (see `limitping
-	// hooks install`). Without them we don't guess from the process list — the
-	// scheduler just pings.
-	if !activity.Enabled("claude") {
+func (c *Claude) ActiveTask(ctx context.Context) (string, bool, error) {
+	// The CLI hooks (see `limitping hooks install`) are the primary signal.
+	// Without them, Claude Code's own session list says which sessions are
+	// mid-turn; a Claude Code too old to have one leaves the scheduler to just
+	// ping. Neither guesses from the process list.
+	if activity.Enabled("claude") {
+		return activity.Active("claude")
+	}
+	sessions, err := ClaudeSessions(ctx)
+	if err != nil {
 		return "", false, nil
 	}
-	return activity.Active("claude")
+	desc, busy := claudeBusySession(sessions)
+	return desc, busy, nil
 }
 
 type claudeWindow struct {
@@ -105,28 +124,127 @@ type claudeWindow struct {
 type claudeUsageResp struct {
 	FiveHour claudeWindow `json:"five_hour"`
 	SevenDay claudeWindow `json:"seven_day"`
+	// Limits is the server's own list of the meters that apply, the plan-wide
+	// ones included. Claude Code renders it verbatim, classifying rows only by
+	// kind, so a new meter needs no client release.
+	Limits []claudeLimitRow `json:"limits"`
+	// Present only when the request asked for it (claudeResetCardsURL).
+	CedarEmber *claudeResetStatus `json:"cedar_ember"`
 }
 
+type claudeLimitRow struct {
+	Kind     string  `json:"kind"`
+	Percent  float64 `json:"percent"`
+	ResetsAt string  `json:"resets_at"`
+	Scope    *struct {
+		Model *struct {
+			DisplayName string `json:"display_name"`
+		} `json:"model"`
+		Surface *struct {
+			DisplayName string `json:"display_name"`
+		} `json:"surface"`
+	} `json:"scope"`
+}
+
+// claudeScopedLimits keeps the rows beyond the plan-wide session and weekly
+// windows (which five_hour and seven_day already carry) — today the per-model
+// weekly caps — labelled the way the server labels them.
+func claudeScopedLimits(rows []claudeLimitRow) []usage.ScopedLimit {
+	var out []usage.ScopedLimit
+	for _, r := range rows {
+		if r.Kind == "session" || r.Kind == "weekly_all" {
+			continue
+		}
+		label := r.Kind
+		if r.Scope != nil && r.Scope.Model != nil && r.Scope.Model.DisplayName != "" {
+			label = r.Scope.Model.DisplayName
+		} else if r.Scope != nil && r.Scope.Surface != nil && r.Scope.Surface.DisplayName != "" {
+			label = r.Scope.Surface.DisplayName
+		}
+		w := usage.Window{UsedPercent: r.Percent, ResetsAt: parseTime(r.ResetsAt)}
+		if strings.HasPrefix(r.Kind, "weekly") {
+			w.WindowSeconds = claudeWeeklySec
+		}
+		out = append(out, usage.ScopedLimit{Label: label, Window: w})
+	}
+	return out
+}
+
+// claudeBuckets collects the narrower windows the usage response reports under
+// their own keys — seven_day_opus, seven_day_sonnet and the like — by the name a
+// reset card's "clears" uses for them. Keys whose value is null (a limit the
+// plan does not have) are left out.
+func claudeBuckets(body []byte) map[string]usage.Window {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(body, &fields) != nil {
+		return nil
+	}
+	var out map[string]usage.Window
+	for name, raw := range fields {
+		if name == "five_hour" || name == "seven_day" ||
+			!(strings.HasPrefix(name, "five_hour_") || strings.HasPrefix(name, "seven_day_")) {
+			continue
+		}
+		var w *struct {
+			Utilization *float64 `json:"utilization"`
+			ResetsAt    string   `json:"resets_at"`
+		}
+		// A window carries a utilization; other objects under these prefixes
+		// (seven_day_breakdown) are not windows.
+		if json.Unmarshal(raw, &w) != nil || w == nil || w.Utilization == nil {
+			continue
+		}
+		if out == nil {
+			out = map[string]usage.Window{}
+		}
+		seconds := claudeWeeklySec
+		if strings.HasPrefix(name, "five_hour_") {
+			seconds = claudeFiveHourSec
+		}
+		out[name] = usage.Window{UsedPercent: *w.Utilization, ResetsAt: parseTime(w.ResetsAt), WindowSeconds: seconds}
+	}
+	return out
+}
+
+// setClaudeOAuthHeaders dresses a request to Anthropic's OAuth endpoints.
+func setClaudeOAuthHeaders(req *http.Request, token, userAgent string) {
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("anthropic-beta", claudeOAuthBeta)
+	req.Header.Set("User-Agent", userAgent)
+}
+
+// ReadUsage reads the windows, and nothing else, whatever the config says:
+// reading the reset cards takes a request presenting as the Claude CLI, which
+// only the commands that show or spend them (ReadUsageWithResetCredits) and
+// the loops that auto-redeem (ReadUsageForAutoRedeem) ever send.
 func (c *Claude) ReadUsage(ctx context.Context) (*usage.Usage, error) {
+	u, _, err := c.readUsage(ctx, claudeUsageURL, claudeCodeUserAgent())
+	if err != nil {
+		return nil, err
+	}
+	return u, nil
+}
+
+// readUsage makes one usage request and parses the windows, plus the reset
+// cards when the URL asked for them.
+func (c *Claude) readUsage(ctx context.Context, endpoint, userAgent string) (*usage.Usage, *claudeResetStatus, error) {
 	body, err := fetchWithAuth(ctx, c.auth, func(token string) (*http.Request, error) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, claudeUsageURL, nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 		if err != nil {
 			return nil, err
 		}
-		req.Header.Set("Authorization", "Bearer "+token)
-		req.Header.Set("Accept", "application/json")
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("anthropic-beta", claudeOAuthBeta)
-		req.Header.Set("User-Agent", claudeCodeUserAgent())
+		setClaudeOAuthHeaders(req, token, userAgent)
 		return req, nil
 	})
 	if err != nil {
-		return nil, diagnoseClaudeUsageError(ctx, c.auth, err)
+		return nil, nil, diagnoseClaudeUsageError(ctx, c.auth, err)
 	}
 
 	var r claudeUsageResp
 	if err := json.Unmarshal(body, &r); err != nil {
-		return nil, fmt.Errorf("claude usage: parsing response: %w", err)
+		return nil, nil, fmt.Errorf("claude usage: parsing response: %w", err)
 	}
 
 	u := &usage.Usage{
@@ -143,9 +261,11 @@ func (c *Claude) ReadUsage(ctx context.Context) (*usage.Usage, error) {
 			ResetsAt:      parseTime(r.SevenDay.ResetsAt),
 			WindowSeconds: claudeWeeklySec,
 		},
+		ScopedLimits: claudeScopedLimits(r.Limits),
+		Buckets:      claudeBuckets(body),
 	}
 	u.LimitReached = u.FiveHour.UsedPercent >= 100 || u.Weekly.UsedPercent >= 100
-	return u, nil
+	return u, r.CedarEmber, nil
 }
 
 // diagnoseClaudeUsageError resolves the ambiguity unique to Claude's OAuth
@@ -181,12 +301,8 @@ func claudeSubscriptionAccessUnavailable(ctx context.Context, src tokenSource) b
 	if err != nil {
 		return false
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Content-Type", "application/json")
+	setClaudeOAuthHeaders(req, token, claudeCodeUserAgent())
 	req.Header.Set("anthropic-version", claudeAPIVersion)
-	req.Header.Set("anthropic-beta", claudeOAuthBeta)
-	req.Header.Set("User-Agent", claudeCodeUserAgent())
 
 	resp, err := usageHTTPClient.Do(req)
 	if err != nil {
@@ -228,8 +344,20 @@ func claudeNormalizedText(text string) string {
 }
 
 func claudeCodeUserAgent() string {
-	claudeUserAgentOnce.Do(func() {
-		claudeUserAgent = "claude-code/" + claudeFallbackVer
+	return "claude-code/" + installedClaudeVersion()
+}
+
+// claudeCLIUserAgent is the User-Agent Claude Code's interactive CLI sends. The
+// reset-card requests need it: the server decides from it which product is
+// asking, and offers reset cards only to the CLI — under any other agent they
+// read back as ineligible ("surface"). Nothing else uses it.
+func claudeCLIUserAgent() string {
+	return "claude-cli/" + installedClaudeVersion() + " (external, cli)"
+}
+
+func installedClaudeVersion() string {
+	claudeVersionOnce.Do(func() {
+		claudeVersion = claudeFallbackVer
 
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
@@ -239,10 +367,10 @@ func claudeCodeUserAgent() string {
 			return
 		}
 		if version := normalizedClaudeVersion(string(out)); version != "" {
-			claudeUserAgent = "claude-code/" + version
+			claudeVersion = version
 		}
 	})
-	return claudeUserAgent
+	return claudeVersion
 }
 
 func normalizedClaudeVersion(raw string) string {
@@ -262,15 +390,36 @@ func (c *Claude) Trigger(ctx context.Context, dryRun bool) (*TriggerResult, erro
 	if c.cfg.Model != "" {
 		args = append(args, "--model", c.cfg.Model)
 	}
-	args = append(args, claudeInteractiveArgs(c.cfg.ExtraArgs)...)
-	args = append(args, prompt)
+	extra := claudeInteractiveArgs(c.cfg.ExtraArgs)
+	sessionID := newClaudeSessionID()
+	isolation := claudePingIsolationArgs(sessionID, extra)
+	if !slices.Contains(isolation, "--session-id") {
+		sessionID = "" // not ours to name, so not ours to delete
+	}
+	args = append(args, isolation...)
+	args = append(args, extra...)
+	// "--" ends the options so no variadic one (--tools, --allowedTools, …)
+	// swallows the prompt as one more value; it would then never be sent.
+	args = append(args, "--", prompt)
 
-	res := &TriggerResult{Command: "claude " + shellJoin(args)}
+	// Only a ping whose transcript will be deleted may borrow a directory.
+	dir, borrowed := claudePingDir(sessionID != "")
+
+	// An unset model leaves Model empty: Claude Code resolves its own default
+	// from settings precedence limitping does not reproduce, and guessing would
+	// be worse than saying nothing.
+	res := &TriggerResult{Command: "claude " + shellJoin(args), Model: c.cfg.Model}
+	if borrowed {
+		res.Command = "cd " + shellJoin([]string{dir}) + " && " + res.Command
+	}
 	if dryRun {
 		return res, nil
 	}
 
-	sess, err := terminal.Start(ctx, "claude", args)
+	cmd := exec.CommandContext(ctx, "claude", args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), claudePingEnv...)
+	sess, err := terminal.Start(ctx, cmd)
 	if err != nil {
 		return res, fmt.Errorf("claude interactive failed to start: %w", err)
 	}
@@ -282,8 +431,20 @@ func (c *Claude) Trigger(ctx context.Context, dryRun bool) (*TriggerResult, erro
 	}()
 
 	done := make(chan error, 1)
+	exited := make(chan struct{})
 	go func() {
 		done <- sess.Wait()
+		close(exited)
+	}()
+	// Every return below has asked the session to exit or killed it, but some
+	// only wait a second for it; the transcript is deleted once it is really
+	// gone, so a session still flushing cannot write it back.
+	defer func() {
+		select {
+		case <-exited:
+		case <-time.After(claudeTranscriptWait):
+		}
+		removeClaudePingTranscript(sessionID)
 	}()
 
 	// Phase 1: wait for the TUI to render and settle so the submit Enter lands on
@@ -323,7 +484,7 @@ func (c *Claude) Trigger(ctx context.Context, dryRun bool) (*TriggerResult, erro
 		case <-done:
 		case <-time.After(time.Second):
 		}
-		if accessErr := claudeSubscriptionErrorFromOutput(output.Bytes()); accessErr != nil {
+		if accessErr := claudeOutputError(output.Bytes()); accessErr != nil {
 			return res, accessErr
 		}
 		return res, nil
@@ -358,7 +519,7 @@ func claudeAwait(ctx context.Context, sess terminal.Session, output *limitedBuff
 }
 
 func claudeInteractiveErr(err error, output *limitedBuffer) error {
-	if accessErr := claudeSubscriptionErrorFromOutput(output.Bytes()); accessErr != nil {
+	if accessErr := claudeOutputError(output.Bytes()); accessErr != nil {
 		return accessErr
 	}
 	if err == nil {
@@ -369,6 +530,30 @@ func claudeInteractiveErr(err error, output *limitedBuffer) error {
 		return fmt.Errorf("claude interactive failed: %w", err)
 	}
 	return fmt.Errorf("claude interactive failed: %w: %s", err, tail)
+}
+
+// claudeOutputError reports what Claude Code printed instead of running the
+// ping, when it exits cleanly without having sent anything.
+func claudeOutputError(raw []byte) error {
+	if err := claudeSubscriptionErrorFromOutput(raw); err != nil {
+		return err
+	}
+	return claudeTrustPromptFromOutput(raw)
+}
+
+// claudeTrustPromptFromOutput catches Claude Code's workspace-trust dialog. It
+// appears for a directory nobody has trusted yet — the one watch was started
+// in — and its default answer is "No, exit", so the Enter meant to submit the
+// prompt quits instead: a clean exit with no request sent, which would
+// otherwise read as a successful ping. limitping does not answer it for the
+// user; trusting a directory is theirs to decide.
+func claudeTrustPromptFromOutput(raw []byte) error {
+	compact := strings.ReplaceAll(claudeNormalizedText(string(raw)), " ", "")
+	if !strings.Contains(compact, "itrustthisfolder") && !strings.Contains(compact, "oneyoutrust") {
+		return nil
+	}
+	dir, _ := os.Getwd()
+	return fmt.Errorf("claude asked whether to trust %s and the ping cannot answer that, so nothing was sent: run `claude` there once and trust it, or start limitping from a directory Claude Code already trusts", dir)
 }
 
 // claudeSubscriptionErrorFromOutput reports the denial Claude Code printed
@@ -388,7 +573,7 @@ func claudeInteractiveCancel(ctx context.Context, sess terminal.Session, done <-
 	case <-done:
 	case <-time.After(time.Second):
 	}
-	if accessErr := claudeSubscriptionErrorFromOutput(output.Bytes()); accessErr != nil {
+	if accessErr := claudeOutputError(output.Bytes()); accessErr != nil {
 		return accessErr
 	}
 	tail := truncate(output.Bytes(), 300)

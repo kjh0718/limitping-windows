@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"os"
 	"strings"
 	"time"
 
@@ -13,8 +15,14 @@ import (
 
 	"github.com/wavever/CCLimitPing/internal/config"
 	"github.com/wavever/CCLimitPing/internal/provider"
+	"github.com/wavever/CCLimitPing/internal/spend"
 	"github.com/wavever/CCLimitPing/internal/usage"
 )
+
+// spendTimeout caps the local transcript scan. It runs alongside the usage
+// fetch, so it normally costs nothing in wall time; the cap is there so a huge
+// or unreadable transcript history cannot hold up the whole command.
+const spendTimeout = 20 * time.Second
 
 func newStatusCmd() *cobra.Command {
 	var verbose bool
@@ -35,7 +43,7 @@ func newStatusCmd() *cobra.Command {
 			if len(providers) == 0 {
 				return fmt.Errorf("no providers enabled in config")
 			}
-			return runStatus(cmd.Context(), cmd.OutOrStdout(), cmd.ErrOrStderr(), text, providers, verbose, jsonOut, cfg.UsageDisplay)
+			return runStatus(cmd.Context(), cmd.OutOrStdout(), transientProgress(cmd.ErrOrStderr()), text, providers, verbose, jsonOut, cfg.UsageDisplay, true)
 		},
 	}
 	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, text.statusVerboseFlag)
@@ -43,7 +51,7 @@ func newStatusCmd() *cobra.Command {
 	return cmd
 }
 
-func runStatus(ctx context.Context, out, progress io.Writer, text cliText, providers []provider.Provider, verbose, jsonOut bool, display string) error {
+func runStatus(ctx context.Context, out, progress io.Writer, text cliText, providers []provider.Provider, verbose, jsonOut bool, display string, withResetCredits bool) error {
 	if progress == nil {
 		progress = io.Discard
 	}
@@ -56,12 +64,27 @@ func runStatus(ctx context.Context, out, progress io.Writer, text cliText, provi
 	failed := 0
 	entries := make([]statusJSON, 0, len(providers))
 	for _, p := range providers {
+		// Started first and collected last: reading the month's transcripts is
+		// pure local I/O, so it rides along with the network round trip instead
+		// of adding to it.
+		spendCh := make(chan *spend.Summary, 1)
+		go func() { spendCh <- localSpend(ctx, p.Name()) }()
+
 		if text.statusFetchingFmt != "" {
 			fmt.Fprintf(progress, text.statusFetchingFmt, p.Name())
 		}
+		read := p.ReadUsage
+		if withResetCredits {
+			read = func(ctx context.Context) (*usage.Usage, error) { return readUsageWithResetCredits(ctx, p) }
+		}
 		readCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		u, err := p.ReadUsage(readCtx)
+		u, err := read(readCtx)
 		cancel()
+		sum := <-spendCh
+		// The progress line only stands in for the block that answers it.
+		if text.statusFetchingFmt != "" {
+			fmt.Fprint(progress, eraseLine)
+		}
 		if err != nil {
 			failed++
 			if jsonOut {
@@ -72,10 +95,13 @@ func runStatus(ctx context.Context, out, progress io.Writer, text cliText, provi
 			continue
 		}
 		if jsonOut {
-			entries = append(entries, newStatusJSON(u, verbose))
+			entries = append(entries, newStatusJSON(u, verbose, sum))
 			continue
 		}
-		printUsage(out, text, u, verbose, display)
+		printUsageBody(out, text, u, verbose, display, sum)
+		// Inside the provider's block, so status and ping render it alike.
+		fmt.Fprint(out, hooksAdvice(text, p.Name()))
+		fmt.Fprintln(out)
 	}
 	if jsonOut {
 		enc := json.NewEncoder(out)
@@ -88,6 +114,19 @@ func runStatus(ctx context.Context, out, progress io.Writer, text cliText, provi
 		return fmt.Errorf("status failed for %d provider(s)", failed)
 	}
 	return nil
+}
+
+// eraseLine returns the cursor to the start of the line and clears it.
+const eraseLine = "\r\033[K"
+
+// transientProgress returns w for progress lines that are erased once done, or
+// io.Discard when w is not a terminal: piped or redirected, nothing would
+// erase the line, and it would be left behind as noise in the output.
+func transientProgress(w io.Writer) io.Writer {
+	if f, ok := w.(*os.File); ok && isTerminal(f) && os.Getenv("TERM") != "dumb" {
+		return w
+	}
+	return io.Discard
 }
 
 func localizedProviderError(text cliText, err error) string {
@@ -106,12 +145,25 @@ type statusJSON struct {
 	Plan         string            `json:"plan,omitempty"`
 	FiveHour     *windowJSON       `json:"five_hour,omitempty"`
 	Weekly       *windowJSON       `json:"weekly,omitempty"`
+	Scoped       []scopedJSON      `json:"scoped_limits,omitempty"`
 	Credits      *creditsJSON      `json:"credits,omitempty"`
 	ResetCredits *resetCreditsJSON `json:"reset_credits,omitempty"`
-	LimitReached bool              `json:"limit_reached"`
-	FetchedAt    string            `json:"fetched_at,omitempty"`
-	Raw          json.RawMessage   `json:"raw,omitempty"`
-	Error        string            `json:"error,omitempty"`
+	// Why the reset credits could not be read, when they could not.
+	ResetCreditsError string          `json:"reset_credits_error,omitempty"`
+	Today             *spendJSON      `json:"today,omitempty"`
+	Week              *spendJSON      `json:"week,omitempty"`
+	Month             *spendJSON      `json:"month,omitempty"`
+	LimitReached      bool            `json:"limit_reached"`
+	FetchedAt         string          `json:"fetched_at,omitempty"`
+	Raw               json.RawMessage `json:"raw,omitempty"`
+	Error             string          `json:"error,omitempty"`
+}
+
+// scopedJSON is a limit narrower than the plan-wide windows, e.g. one model's
+// weekly cap.
+type scopedJSON struct {
+	Label string `json:"label"`
+	*windowJSON
 }
 
 type windowJSON struct {
@@ -132,6 +184,11 @@ type creditsJSON struct {
 type resetCreditsJSON struct {
 	AvailableCount int               `json:"available_count"`
 	Credits        []resetCreditJSON `json:"credits,omitempty"`
+	// Why the provider offers this caller no reset cards (Claude's
+	// ineligible_reason), when that is worth knowing.
+	UnavailableReason string `json:"unavailable_reason,omitempty"`
+	// When the backend next accepts a reset, if it has said.
+	CooldownUntil string `json:"cooldown_until,omitempty"`
 }
 
 type resetCreditJSON struct {
@@ -139,9 +196,41 @@ type resetCreditJSON struct {
 	GrantedAt  string `json:"granted_at,omitempty"`
 	ExpiresAt  string `json:"expires_at,omitempty"`
 	RedeemedAt string `json:"redeemed_at,omitempty"`
+	// Claude reset cards only.
+	ID            string   `json:"id,omitempty"`
+	Label         string   `json:"label,omitempty"`
+	Left          int      `json:"left,omitempty"`
+	Total         int      `json:"total,omitempty"`
+	Clears        []string `json:"clears,omitempty"`
+	RequiresLimit bool     `json:"requires_limit,omitempty"`
 }
 
-func newStatusJSON(u *usage.Usage, verbose bool) statusJSON {
+// spendJSON is the local token consumption over a calendar period (the day, the
+// week since Monday, the month since the 1st), read from the provider CLI's own
+// transcripts. start is the period's first local day; today also carries it as
+// date, the key it has always had. cost_usd is what those tokens would cost at
+// API rates; cost_complete is false when a model that ran had no published
+// rates, which makes cost_usd a lower bound.
+type spendJSON struct {
+	Date                string           `json:"date,omitempty"`
+	Start               string           `json:"start"`
+	InputTokens         int              `json:"input_tokens"`
+	CacheReadTokens     int              `json:"cache_read_tokens"`
+	CacheCreationTokens int              `json:"cache_creation_tokens"`
+	OutputTokens        int              `json:"output_tokens"`
+	TotalTokens         int              `json:"total_tokens"`
+	CostUSD             float64          `json:"cost_usd"`
+	CostComplete        bool             `json:"cost_complete"`
+	Models              []spendModelJSON `json:"models,omitempty"`
+}
+
+type spendModelJSON struct {
+	Model       string  `json:"model,omitempty"`
+	TotalTokens int     `json:"total_tokens"`
+	CostUSD     float64 `json:"cost_usd"`
+}
+
+func newStatusJSON(u *usage.Usage, verbose bool, sum *spend.Summary) statusJSON {
 	s := statusJSON{
 		Provider:     u.Provider,
 		Plan:         u.Plan,
@@ -155,6 +244,9 @@ func newStatusJSON(u *usage.Usage, verbose bool) statusJSON {
 	if !u.Weekly.Missing() {
 		s.Weekly = newWindowJSON(u.Weekly)
 	}
+	for _, l := range u.ScopedLimits {
+		s.Scoped = append(s.Scoped, scopedJSON{Label: l.Label, windowJSON: newWindowJSON(l.Window)})
+	}
 	if !u.FetchedAt.IsZero() {
 		s.FetchedAt = u.FetchedAt.Format(time.RFC3339)
 	}
@@ -167,6 +259,17 @@ func newStatusJSON(u *usage.Usage, verbose bool) statusJSON {
 	}
 	if u.ResetCredits != nil {
 		s.ResetCredits = newResetCreditsJSON(u.ResetCredits)
+	}
+	if u.ResetCreditsError != nil {
+		s.ResetCreditsError = u.ResetCreditsError.Error()
+	}
+	if sum != nil {
+		s.Today = newSpendJSON(sum.Today)
+		if s.Today != nil {
+			s.Today.Date = s.Today.Start
+		}
+		s.Week = newSpendJSON(sum.Week)
+		s.Month = newSpendJSON(sum.Month)
 	}
 	if verbose && json.Valid(u.Raw) {
 		s.Raw = json.RawMessage(u.Raw)
@@ -190,18 +293,59 @@ func newWindowJSON(w usage.Window) *windowJSON {
 
 func newResetCreditsJSON(rc *usage.ResetCredits) *resetCreditsJSON {
 	out := &resetCreditsJSON{
-		AvailableCount: rc.AvailableCount,
-		Credits:        make([]resetCreditJSON, 0, len(rc.Credits)),
+		AvailableCount:    rc.AvailableCount,
+		Credits:           make([]resetCreditJSON, 0, len(rc.Credits)),
+		UnavailableReason: rc.UnavailableReason,
+		CooldownUntil:     timeJSON(rc.CooldownUntil),
 	}
 	for _, c := range rc.Credits {
 		out.Credits = append(out.Credits, resetCreditJSON{
-			Status:     c.Status,
-			GrantedAt:  timeJSON(c.GrantedAt),
-			ExpiresAt:  timeJSON(c.ExpiresAt),
-			RedeemedAt: timeJSON(c.RedeemedAt),
+			Status:        c.Status,
+			GrantedAt:     timeJSON(c.GrantedAt),
+			ExpiresAt:     timeJSON(c.ExpiresAt),
+			RedeemedAt:    timeJSON(c.RedeemedAt),
+			ID:            c.ID,
+			Label:         c.Label,
+			Left:          c.Left,
+			Total:         c.Total,
+			Clears:        c.Clears,
+			RequiresLimit: c.RequiresLimit,
 		})
 	}
 	return out
+}
+
+// newSpendJSON renders a period's spend, or nothing at all when the provider's
+// CLI has never run on this machine — an absent key says "no local data", which
+// zeros would misreport as "nothing was spent".
+func newSpendJSON(p spend.Period) *spendJSON {
+	if !p.Available {
+		return nil
+	}
+	out := &spendJSON{
+		Start:               p.Start.Format("2006-01-02"),
+		InputTokens:         p.Tokens.Input,
+		CacheReadTokens:     p.Tokens.CacheRead,
+		CacheCreationTokens: p.Tokens.CacheWrite,
+		OutputTokens:        p.Tokens.Output,
+		TotalTokens:         p.Tokens.Total(),
+		CostUSD:             roundUSD(p.CostUSD),
+		CostComplete:        p.Priced,
+	}
+	for _, m := range p.Models {
+		out.Models = append(out.Models, spendModelJSON{
+			Model:       m.Model,
+			TotalTokens: m.Tokens.Total(),
+			CostUSD:     roundUSD(m.CostUSD),
+		})
+	}
+	return out
+}
+
+// roundUSD trims the float noise (0.30000000000000004) that summing per-model
+// costs leaves behind, at a precision finer than any real per-day total needs.
+func roundUSD(v float64) float64 {
+	return math.Round(v*1e6) / 1e6
 }
 
 func timeJSON(t time.Time) string {
@@ -211,7 +355,15 @@ func timeJSON(t time.Time) string {
 	return t.Format(time.RFC3339)
 }
 
-func printUsage(out io.Writer, text cliText, u *usage.Usage, verbose bool, display string) {
+// printUsage renders one provider's block, closed by a blank line.
+func printUsage(out io.Writer, text cliText, u *usage.Usage, verbose bool, display string, sum *spend.Summary) {
+	printUsageBody(out, text, u, verbose, display, sum)
+	fmt.Fprintln(out)
+}
+
+// printUsageBody is printUsage without the closing blank line, for callers that
+// add lines of their own to the block.
+func printUsageBody(out io.Writer, text cliText, u *usage.Usage, verbose bool, display string, sum *spend.Summary) {
 	display = normalizeUsageDisplay(display)
 	plan := u.Plan
 	if plan != "" {
@@ -220,6 +372,10 @@ func printUsage(out io.Writer, text cliText, u *usage.Usage, verbose bool, displ
 	fmt.Fprintf(out, "%s%s\n", u.Provider, plan)
 	fmt.Fprintf(out, text.statusFiveHourLineFmt, fmtWindow(text, u.FiveHour, display))
 	fmt.Fprintf(out, text.statusWeeklyLineFmt, fmtWindow(text, u.Weekly, display))
+	for _, l := range u.ScopedLimits {
+		fmt.Fprintf(out, text.statusScopedLineFmt, l.Label, fmtWindow(text, l.Window, display))
+	}
+	printSpend(out, text, sum, verbose)
 	if u.Credits != nil && (u.Credits.HasCredits || u.Credits.Unlimited) {
 		if u.Credits.Unlimited {
 			fmt.Fprint(out, text.statusCreditsUnlimited)
@@ -228,14 +384,104 @@ func printUsage(out io.Writer, text cliText, u *usage.Usage, verbose bool, displ
 		}
 	}
 	printResetCredits(out, text, u.ResetCredits)
+	// A card read that failed is not the same as holding none, but saying so
+	// on every status would be noise for the many accounts that never hold any.
+	if verbose && u.ResetCreditsError != nil {
+		fmt.Fprintf(out, text.statusResetCreditsUnreadFmt, u.ResetCreditsError)
+	}
 	if verbose {
 		fmt.Fprintf(out, "  raw: %s\n", string(u.Raw))
 	}
-	fmt.Fprintln(out)
+}
+
+// localSpend reads what the provider's local CLI sessions consumed today, this
+// week and this month. It is a best-effort extra: a transcript that cannot be
+// read costs the lines, never the status command.
+func localSpend(ctx context.Context, name string) *spend.Summary {
+	ctx, cancel := context.WithTimeout(ctx, spendTimeout)
+	defer cancel()
+	sum, err := spend.Summarize(ctx, name, time.Now())
+	if err != nil && sum.Month.Empty() && sum.Week.Empty() {
+		return nil
+	}
+	return &sum
+}
+
+// printSpend renders the day's, week's and month's token consumption and what
+// it would have cost at API rates — the usage endpoints report percentages
+// only, so this is the one place a subscription's actual consumption becomes a
+// number. Nothing is printed for a provider whose CLI has never run on this
+// machine: silence is honest there, while "0 tokens" would claim a quiet month.
+func printSpend(out io.Writer, text cliText, sum *spend.Summary, verbose bool) {
+	if sum == nil || !sum.Today.Available {
+		return
+	}
+	printPeriod(out, text, text.statusTodayLineFmt, sum.Today, verbose)
+	printPeriod(out, text, text.statusWeekSpendLineFmt, sum.Week, verbose)
+	printPeriod(out, text, text.statusMonthSpendLineFmt, sum.Month, verbose)
+}
+
+// printPeriod renders one period's line under lineFmt, followed with -v by its
+// token buckets and per-model split.
+func printPeriod(out io.Writer, text cliText, lineFmt string, p spend.Period, verbose bool) {
+	fmt.Fprintf(out, lineFmt, fmtSpend(text, p.Tokens.Total(), p.CostUSD))
+	if !verbose || p.Empty() {
+		return
+	}
+	fmt.Fprintf(out, text.statusTodayBreakdownFmt,
+		humanTokens(p.Tokens.Input), humanTokens(p.Tokens.CacheRead),
+		humanTokens(p.Tokens.CacheWrite), humanTokens(p.Tokens.Output))
+	for _, m := range p.Models {
+		name := m.Model
+		if name == "" {
+			name = text.statusTodayUnknownModel
+		}
+		fmt.Fprintf(out, text.statusTodayModelFmt, name, fmtSpend(text, m.Tokens.Total(), m.CostUSD))
+	}
+}
+
+// fmtSpend renders "47.9M tokens  ≈ $38.15", dropping the cost when the model's
+// rates are unknown (an unpublished or brand-new model).
+func fmtSpend(text cliText, tokens int, costUSD float64) string {
+	s := fmt.Sprintf(text.statusTodayTokensFmt, humanTokens(tokens))
+	if costUSD > 0 {
+		s += fmt.Sprintf(text.statusTodayCostFmt, fmtUSD(costUSD))
+	}
+	return s
+}
+
+// humanTokens keeps the status line scannable: exact below 10k, where the digits
+// are still readable, and abbreviated above it. `--json` carries exact counts.
+func humanTokens(n int) string {
+	switch {
+	case n < 10_000:
+		return humanInt(n)
+	case n < 1_000_000:
+		return fmt.Sprintf("%.1fK", float64(n)/1e3)
+	case n < 1_000_000_000:
+		return fmt.Sprintf("%.1fM", float64(n)/1e6)
+	default:
+		return fmt.Sprintf("%.2fB", float64(n)/1e9)
+	}
+}
+
+// fmtUSD shows cents, falling back to four decimals for the sums too small to
+// register in them.
+func fmtUSD(v float64) string {
+	if v < 0.01 {
+		return fmt.Sprintf("%.4f", v)
+	}
+	return fmt.Sprintf("%.2f", v)
 }
 
 func printResetCredits(out io.Writer, text cliText, rc *usage.ResetCredits) {
-	if rc == nil || (rc.AvailableCount == 0 && len(rc.Credits) == 0) {
+	if rc != nil && rc.UnavailableReason != "" {
+		fmt.Fprintf(out, text.statusResetCreditsUnavailableFmt, resetCardsUnavailableText(text, rc.UnavailableReason))
+		return
+	}
+	// With none left to redeem, the redeemed and expired cards are history that
+	// only crowds the block; `status --json` still carries them.
+	if rc == nil || rc.AvailableCount == 0 {
 		return
 	}
 	countFmt := text.statusResetCreditsManyFmt
@@ -264,6 +510,19 @@ func resetCreditLine(text cliText, c usage.ResetCredit) string {
 		}
 	}
 	parts := []string{creditStatusWord(text, status)}
+	if c.Label != "" {
+		parts = append(parts, c.Label)
+	}
+	// A multi-use grant; a single reset needs no count.
+	if c.Total > 1 {
+		parts = append(parts, fmt.Sprintf(text.statusCreditLeftFmt, c.Left, c.Total))
+	}
+	if windows := clearedWindowNames(text, c.Clears); windows != "" {
+		parts = append(parts, fmt.Sprintf(text.statusCreditClearsFmt, windows))
+	}
+	if c.RequiresLimit {
+		parts = append(parts, text.statusCreditAtLimitOnly)
+	}
 	if !c.GrantedAt.IsZero() {
 		parts = append(parts, fmt.Sprintf(text.statusCreditGrantedFmt, c.GrantedAt.Local().Format(text.statusCreditTimeLayout)))
 	}
@@ -295,9 +554,33 @@ func creditStatusWord(text cliText, status string) string {
 		return text.statusCreditRedeemed
 	case "expired":
 		return text.statusCreditExpired
+	case provider.ClaudeGrantQueued:
+		return text.statusCreditQueued
+	case provider.ClaudeGrantPaused:
+		return text.statusCreditPaused
+	case provider.ClaudeGrantPending:
+		return text.statusCreditPending
 	default:
 		return status
 	}
+}
+
+// clearedWindowNames renders the windows a reset restores ("5h + weekly").
+// Limits limitping has no name for (Claude's per-model weekly buckets) are
+// shown as the provider names them.
+func clearedWindowNames(text cliText, clears []string) string {
+	names := make([]string, 0, len(clears))
+	for _, w := range clears {
+		switch w {
+		case usage.ClearsFiveHour:
+			names = append(names, text.statusClearsFiveHour)
+		case usage.ClearsWeekly:
+			names = append(names, text.statusClearsWeekly)
+		default:
+			names = append(names, w)
+		}
+	}
+	return strings.Join(names, " + ")
 }
 
 func fmtWindow(text cliText, w usage.Window, display string) string {

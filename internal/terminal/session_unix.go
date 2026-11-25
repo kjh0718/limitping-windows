@@ -7,33 +7,52 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"sync"
 
 	"github.com/creack/pty"
 )
 
 // unixSession wraps a creack/pty master file and the exec.Cmd running under it.
-// This preserves the exact behavior the provider triggers relied on before the
-// terminal seam was introduced: exec.CommandContext binds ctx cancellation to
-// the child, pty.Start attaches the PTY, and the master file is the child's
-// stdin/stdout.
+// This preserves the behavior the provider triggers relied on before the
+// terminal seam was introduced: pty.Start attaches the PTY, and the master file
+// is the child's stdin/stdout.
 type unixSession struct {
 	cmd  *exec.Cmd
 	ptmx *os.File
+	// waited is closed by Wait, ending the context watcher.
+	waited     chan struct{}
+	waitedOnce sync.Once
 }
 
-func start(ctx context.Context, name string, args []string) (Session, error) {
-	cmd := exec.CommandContext(ctx, name, args...)
+func start(ctx context.Context, cmd *exec.Cmd) (Session, error) {
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
 		return nil, err
 	}
-	return &unixSession{cmd: cmd, ptmx: ptmx}, nil
+	s := &unixSession{cmd: cmd, ptmx: ptmx, waited: make(chan struct{})}
+	// A cmd from exec.CommandContext is already bound to its own ctx, but one from
+	// exec.Command is not, and Start's contract is that ctx governs the child.
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = s.Kill()
+		case <-s.waited:
+		}
+	}()
+	return s, nil
 }
+
+// prepareCommand is a no-op: os/exec runs scripts through their shebang on Unix.
+func prepareCommand(*exec.Cmd) error { return nil }
 
 func (s *unixSession) Read(p []byte) (int, error)  { return s.ptmx.Read(p) }
 func (s *unixSession) Write(p []byte) (int, error) { return s.ptmx.Write(p) }
 func (s *unixSession) Close() error                { return s.ptmx.Close() }
-func (s *unixSession) Wait() error                 { return s.cmd.Wait() }
+func (s *unixSession) Wait() error {
+	err := s.cmd.Wait()
+	s.waitedOnce.Do(func() { close(s.waited) })
+	return err
+}
 
 // Kill force-terminates the child. Once Wait has reaped it the process handle is
 // marked done and Process.Kill reports os.ErrProcessDone, which is the state Kill

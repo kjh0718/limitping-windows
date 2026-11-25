@@ -41,7 +41,7 @@ var interactiveArgs = []string{"/Q", "/D", "/K"}
 
 func startSession(t *testing.T, ctx context.Context, name string, args ...string) Session {
 	t.Helper()
-	sess, err := Start(ctx, name, args)
+	sess, err := Start(ctx, exec.Command(name, args...))
 	if err != nil {
 		t.Fatalf("Start(%s %v) = %v", name, args, err)
 	}
@@ -502,7 +502,7 @@ func TestSessionBatchPercentArgFailsToStart(t *testing.T) {
 	shim := writeShim(t, "shim", "limitping-percent.cmd",
 		"@echo off\r\necho __LIMITPING_PERCENT_SHIM__\r\n")
 
-	sess, err := Start(context.Background(), shim, []string{"%PATH%"})
+	sess, err := Start(context.Background(), exec.Command(shim, "%PATH%"))
 	if err == nil {
 		sess.Close()
 		t.Fatal("Start succeeded for a batch argument containing %, want an error")
@@ -701,7 +701,7 @@ func TestSessionConcurrent(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			marker := "__LIMITPING_CONCURRENT_" + string(rune('A'+i)) + "__"
-			sess, err := Start(context.Background(), cmdExe, []string{"/c", "echo " + marker})
+			sess, err := Start(context.Background(), exec.Command(cmdExe, "/c", "echo "+marker))
 			if err != nil {
 				t.Errorf("session %d: Start = %v", i, err)
 				return

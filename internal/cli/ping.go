@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -22,7 +23,7 @@ func newPingCmd() *cobra.Command {
 		Short:     text.pingShort,
 		Long:      text.pingLong,
 		Args:      cobra.MatchAll(cobra.MaximumNArgs(1), cobra.OnlyValidArgs),
-		ValidArgs: []string{"claude", "codex", "spark", "all"},
+		ValidArgs: []string{"claude", "codex", "all"},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name := "all"
 			if len(args) > 0 {
@@ -36,19 +37,35 @@ func newPingCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			out := cmd.OutOrStdout()
-			tty := isTerminal(os.Stdout)
-			var firstErr error
-			for _, p := range providers {
-				if err := runPing(cmd.Context(), out, text, p, dryRun, tty); err != nil && firstErr == nil {
-					firstErr = err
-				}
-			}
-			return firstErr
+			return runPings(cmd.Context(), cmd.OutOrStdout(), text, providers,
+				dryRun, isTerminal(os.Stdout), cfg.UsageDisplay)
 		},
 	}
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, text.pingDryRunFlag)
 	return cmd
+}
+
+// runPings triggers each provider and then reports the window state the pings
+// were meant to change. Reading usage is free and never starts a window, and
+// without it the command only answers "the request went out" while the question
+// actually being asked is "did my window start" — which the ping's own output
+// cannot show, because a ping is far too small to move the used percentage.
+func runPings(ctx context.Context, out io.Writer, text cliText, providers []provider.Provider, dryRun, tty bool, display string) error {
+	var firstErr error
+	for _, p := range providers {
+		if err := runPing(ctx, out, text, p, dryRun, tty); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if dryRun {
+		return firstErr // nothing was sent, so there is no new state to report
+	}
+	fmt.Fprintln(out)
+	// Reported even when a ping failed: that is exactly when the window state
+	// is worth seeing. A failing status read is printed inline by runStatus and
+	// must not turn a successful ping into a failed command.
+	_ = runStatus(ctx, out, io.Discard, text, providers, false, false, display, false)
+	return firstErr
 }
 
 // runPing triggers one provider with live feedback so the user can see what the
@@ -62,11 +79,11 @@ func runPing(parent context.Context, out io.Writer, text cliText, p provider.Pro
 		return err
 	}
 	if dryRun {
-		fmt.Fprintf(out, text.pingWouldRunFmt, name, dry.Command)
+		fmt.Fprintf(out, text.pingWouldRunFmt, name, commandLine(text, dry))
 		return nil
 	}
 
-	fmt.Fprintf(out, "%-7s → %s\n", name, dry.Command)
+	fmt.Fprintf(out, "%-7s → %s\n", name, commandLine(text, dry))
 
 	ctx, cancel := context.WithTimeout(parent, 3*time.Minute)
 	defer cancel()
@@ -96,7 +113,7 @@ func runPing(parent context.Context, out io.Writer, text cliText, p provider.Pro
 	for {
 		select {
 		case o := <-done:
-			fmt.Fprint(out, "\r\033[K") // clear the spinner line
+			fmt.Fprint(out, eraseLine) // clear the spinner line
 			report(out, text, name, start, o.res, o.err)
 			return o.err
 		case <-ticker.C:
@@ -104,6 +121,17 @@ func runPing(parent context.Context, out io.Writer, text cliText, p provider.Pro
 			i++
 		}
 	}
+}
+
+// commandLine renders the command to be run, naming the model when the command
+// itself doesn't. limitping only passes -m/--model when one is configured; with
+// it unset the CLI picks the model, and the bare command would leave the user
+// unable to tell which model the ping just spent quota on.
+func commandLine(text cliText, res *provider.TriggerResult) string {
+	if res.Model == "" || strings.Contains(res.Command, res.Model) {
+		return res.Command
+	}
+	return res.Command + fmt.Sprintf(text.pingModelFmt, res.Model)
 }
 
 func report(out io.Writer, text cliText, name string, start time.Time, res *provider.TriggerResult, err error) {
@@ -114,12 +142,12 @@ func report(out io.Writer, text cliText, name string, start time.Time, res *prov
 	fmt.Fprintf(out, text.pingSuccessFmt, name, elapsed(start), usageSuffix(res))
 }
 
-// usageSuffix renders the token/cost tail, e.g. ", 32,934 tok, $0.0110".
+// usageSuffix renders the token/cost tail, e.g. ", 32,934 tokens, $0.0110".
 func usageSuffix(res *provider.TriggerResult) string {
 	if res == nil || !res.HasUsage {
 		return ""
 	}
-	s := fmt.Sprintf(", %s tok (in %s / out %s)",
+	s := fmt.Sprintf(", %s tokens (in %s / out %s)",
 		humanInt(res.TotalTokens), humanInt(res.InputTokens), humanInt(res.OutputTokens))
 	if res.CostUSD > 0 {
 		s += fmt.Sprintf(", $%.4f", res.CostUSD)

@@ -9,8 +9,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -32,14 +34,15 @@ type windowsSession struct {
 	closeOnce sync.Once
 }
 
-func start(ctx context.Context, name string, args []string) (Session, error) {
-	// exec.Command is used only to resolve the executable and assemble argv the
-	// way os/exec would; the process itself has to be created by hand, because
-	// attaching a pseudoconsole needs an extended startup info block that
-	// (*exec.Cmd).Start does not expose.
-	cmd := exec.Command(name, args...)
-	if cmd.Err != nil {
-		return nil, cmd.Err
+func start(ctx context.Context, cmd *exec.Cmd) (Session, error) {
+	// cmd is used only for what os/exec resolved (Path, Args, Dir, Env); the
+	// process itself has to be created by hand, because attaching a pseudoconsole
+	// needs an extended startup info block that (*exec.Cmd).Start does not expose.
+	// That also means cmd.Cancel never runs: ctx is bound to the job object below,
+	// so cancellation tears down the whole tree whichever constructor built cmd.
+	envBlock, err := windowsEnvBlock(cmd.Env)
+	if err != nil {
+		return nil, err
 	}
 
 	pty, err := newConPTY(conPTYSize)
@@ -51,7 +54,7 @@ func start(ctx context.Context, name string, args []string) (Session, error) {
 		pty.teardown()
 		return nil, err
 	}
-	proc, err := startAttached(cmd, pty.hpc, job)
+	proc, err := startAttached(cmd, envBlock, pty.hpc, job)
 	if err != nil {
 		// Closing the job kills anything that did get assigned to it.
 		_ = job.close()
@@ -93,7 +96,7 @@ func start(ctx context.Context, name string, args []string) (Session, error) {
 // maintainers recommend for a ConPTY parent whose own output is redirected. It
 // is also why handle inheritance stays off: nothing is being handed down, and
 // the pseudoconsole duplicates the pipe ends it needs by itself.
-func startAttached(cmd *exec.Cmd, hpc windows.Handle, job *jobObject) (windows.Handle, error) {
+func startAttached(cmd *exec.Cmd, envBlock *uint16, hpc windows.Handle, job *jobObject) (windows.Handle, error) {
 	attrs, err := windows.NewProcThreadAttributeList(1)
 	if err != nil {
 		return 0, fmt.Errorf("NewProcThreadAttributeList: %w", err)
@@ -133,9 +136,17 @@ func startAttached(cmd *exec.Cmd, hpc windows.Handle, job *jobObject) (windows.H
 		return 0, err
 	}
 
-	// A nil environment block inherits this process's environment, which is what
-	// the providers need (PATH, the CLI's own credentials in the user profile).
-	// CREATE_UNICODE_ENVIRONMENT documents that inherited block as Unicode.
+	var dir *uint16
+	if cmd.Dir != "" {
+		if dir, err = windows.UTF16PtrFromString(cmd.Dir); err != nil {
+			return 0, err
+		}
+	}
+
+	// A nil environment block (cmd.Env == nil) inherits this process's
+	// environment, which is what the providers need (PATH, the CLI's own
+	// credentials in the user profile). CREATE_UNICODE_ENVIRONMENT documents both
+	// that inherited block and an explicit one (windowsEnvBlock) as Unicode.
 	var pi windows.ProcessInformation
 	if err := windows.CreateProcess(
 		appName,
@@ -144,8 +155,8 @@ func startAttached(cmd *exec.Cmd, hpc windows.Handle, job *jobObject) (windows.H
 		nil,   // thread security attributes
 		false, // no handle inheritance; the pseudoconsole dups what it needs
 		windows.EXTENDED_STARTUPINFO_PRESENT|windows.CREATE_UNICODE_ENVIRONMENT|windows.CREATE_SUSPENDED,
-		nil, // environment: inherited
-		nil, // working directory: inherited
+		envBlock,
+		dir, // nil: inherited
 		&si.StartupInfo,
 		&pi,
 	); err != nil {
@@ -294,6 +305,89 @@ func quoteBatchArg(arg string) (string, error) {
 	}
 	b.WriteByte('"')
 	return b.String(), nil
+}
+
+// windowsEnvBlock turns cmd.Env into the block CreateProcess takes. nil means
+// "inherit" and stays a nil block. A non-nil env, even an empty one, is exactly
+// the child's environment, built the way os/exec does on Windows: names are
+// case-insensitive so a duplicate keeps the last value, and SYSTEMROOT is carried
+// over from this process when absent, since Windows programs (winsock among them)
+// misbehave without it. The block is sorted case-insensitively by name, which
+// CreateProcess documents as a requirement, and ends in two NULs.
+func windowsEnvBlock(env []string) (*uint16, error) {
+	if env == nil {
+		return nil, nil
+	}
+	last := make(map[string]string, len(env)+1)
+	for _, kv := range env {
+		if strings.IndexByte(kv, 0) >= 0 {
+			return nil, errors.New("terminal: environment entry contains NUL")
+		}
+		// A leading '=' belongs to the name (the "=C:=C:\\" per-drive entries).
+		eq := strings.IndexByte(kv[min(1, len(kv)):], '=')
+		if eq < 0 {
+			continue // no value: meaningless to CreateProcess
+		}
+		eq++ // index in kv, not in the slice
+		last[strings.ToUpper(kv[:eq+1])] = kv
+	}
+	if _, ok := last["SYSTEMROOT="]; !ok {
+		if root := os.Getenv("SYSTEMROOT"); root != "" {
+			last["SYSTEMROOT="] = "SYSTEMROOT=" + root
+		}
+	}
+	keys := make([]string, 0, len(last))
+	for k := range last {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	var block []uint16
+	for _, k := range keys {
+		u, err := windows.UTF16FromString(last[k])
+		if err != nil {
+			return nil, err
+		}
+		block = append(block, u...) // includes the entry's terminating NUL
+	}
+	// Two NULs end the block; an empty one still needs both.
+	block = append(block, 0)
+	if len(block) == 1 {
+		block = append(block, 0)
+	}
+	return &block[0], nil
+}
+
+// prepareCommand rewrites cmd, for use with os/exec rather than this package's
+// Start, so a .cmd/.bat target runs the way a ConPTY session would run it. Go's
+// default argument escaping is not cmd.exe-safe (it escapes a quote as backslash
+// quote, which cmd does not honour, so the rest of the argument becomes live
+// command text). The command is instead run through COMSPEC with batchCommand's
+// quoting, and the ready-made command line is handed to os/exec through
+// SysProcAttr.CmdLine.
+//
+// The guarantees are batchCommand's: every argument reaches the script as one
+// token with its quotes intact, cmd metacharacters stay inert, and an argument
+// holding a NUL, a newline or a % is refused with an error (see quoteBatchArg),
+// since those cannot be carried through cmd.exe. Native executables are left
+// alone. Call it before Run/Start; the result must not be passed to Start, which
+// rejects SysProcAttr.
+func prepareCommand(cmd *exec.Cmd) error {
+	if cmd.Err != nil {
+		return nil // os/exec reports it from Run
+	}
+	switch strings.ToLower(filepath.Ext(cmd.Path)) {
+	case ".cmd", ".bat":
+	default:
+		return nil
+	}
+	comspec, line, err := batchCommand(cmd.Path, cmd.Args[1:])
+	if err != nil {
+		return err
+	}
+	cmd.Path = comspec
+	cmd.Args = []string{comspec}
+	cmd.SysProcAttr = &syscall.SysProcAttr{CmdLine: line}
+	return nil
 }
 
 // wait is the single waiter for the child. It records the exit status, starts

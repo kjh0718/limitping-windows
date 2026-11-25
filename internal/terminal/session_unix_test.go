@@ -5,6 +5,7 @@ package terminal
 import (
 	"bytes"
 	"context"
+	"os/exec"
 	"strings"
 	"sync"
 	"testing"
@@ -19,7 +20,7 @@ func TestStartRunsCommandAndReadsOutput(t *testing.T) {
 	defer cancel()
 
 	const marker = "pty-test-output"
-	sess, err := Start(ctx, "sh", []string{"-c", "echo " + marker})
+	sess, err := Start(ctx, exec.Command("sh", "-c", "echo "+marker))
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -102,7 +103,7 @@ func TestKillTerminatesCommand(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	sess, err := Start(ctx, "sh", []string{"-c", "sleep 60"})
+	sess, err := Start(ctx, exec.Command("sh", "-c", "sleep 60"))
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -147,7 +148,7 @@ func TestKillAfterWaitSucceeds(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	sess, err := Start(ctx, "sh", []string{"-c", "exit 0"})
+	sess, err := Start(ctx, exec.Command("sh", "-c", "exit 0"))
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}

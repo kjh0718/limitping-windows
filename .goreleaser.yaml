@@ -38,18 +38,23 @@ archives:
       - README.md
       - README.zh-CN.md
       - LICENSE
+      # Keep the directory so README links to docs/ still resolve in the archive.
+      - src: docs/*
+        dst: docs
+        strip_parent: true
 
 checksum:
   name_template: "checksums.txt"
 
 changelog:
+  # The commit log IS the release notes — there is no hand-maintained changelog
+  # to drift from it, so write commit subjects that read as release notes.
+  # (The old conventional-commit excludes never matched anything here: this repo
+  # writes plain imperative subjects, not `docs:` / `chore:` prefixes.)
   sort: asc
   filters:
     exclude:
-      - "^docs:"
-      - "^test:"
-      - "^chore:"
-      - "^ci:"
+      - "^Merge "
 
 release:
   github:
@@ -77,7 +82,7 @@ homebrew_casks:
     # Unsigned binary: strip the macOS quarantine flag on install so it runs.
     hooks:
       post:
-        install: |
-          if OS.mac?
-            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/limitping"]
+        install_steps: |
+          on_macos do
+            run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{ .StagedPath }}/limitping"]
           end
