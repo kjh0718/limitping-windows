@@ -13,7 +13,7 @@ import (
 
 func TestRemoveAliasOnlyRemovesOurOwnLink(t *testing.T) {
 	if runtime.GOOS == "windows" {
-		t.Skip("the lmp alias is a symlink installed by install.sh/upgrade, neither of which runs on Windows (creating one also needs a privilege)")
+		t.Skip("no lmp alias is ever installed on Windows (install.sh does not run there), and creating the symlink the test needs requires a privilege")
 	}
 	newInstall := func(t *testing.T) (dir, exe string) {
 		t.Helper()
@@ -84,7 +84,7 @@ func TestRemoveAliasOnlyRemovesOurOwnLink(t *testing.T) {
 // still left the user without the command.
 func TestEnsureAliasCreatesAndKeepsOwnership(t *testing.T) {
 	if runtime.GOOS == "windows" {
-		t.Skip("the lmp alias is a symlink installed by install.sh/upgrade, neither of which runs on Windows (creating one also needs a privilege)")
+		t.Skip("ensureAlias is a no-op on Windows; see TestEnsureAliasIsNoOpOnWindows")
 	}
 	newInstall := func(t *testing.T) (dir, exe string) {
 		t.Helper()
@@ -193,7 +193,7 @@ func TestEnsureAliasCreatesAndKeepsOwnership(t *testing.T) {
 // subprocess because the repair keys off os.Executable.
 func TestVersionCommandRepairsTheAliasForOlderUpgraders(t *testing.T) {
 	if runtime.GOOS == "windows" {
-		t.Skip("the lmp alias is a symlink installed by install.sh/upgrade, neither of which runs on Windows (creating one also needs a privilege)")
+		t.Skip("`version` does not install an alias on Windows; see TestEnsureAliasIsNoOpOnWindows")
 	}
 	if testing.Short() {
 		t.Skip("builds a binary")
@@ -224,5 +224,26 @@ func TestVersionCommandRepairsTheAliasForOlderUpgraders(t *testing.T) {
 	}
 	if !strings.HasPrefix(string(out), "limitping ") {
 		t.Fatalf("version output no longer starts with the version line: %q", out)
+	}
+}
+
+// An extensionless symlink named lmp is useless on Windows, so ensureAlias (which
+// `version` and `upgrade` call) must not create one even where symlinks work.
+func TestEnsureAliasIsNoOpOnWindows(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows-only behaviour")
+	}
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "limitping.exe")
+	if err := os.WriteFile(exe, []byte("binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	ensureAlias(exe, &out)
+	if _, err := os.Lstat(filepath.Join(dir, BinaryAlias)); !os.IsNotExist(err) {
+		t.Fatalf("ensureAlias created an alias on Windows: %v", err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("ensureAlias printed %q on Windows", out.String())
 	}
 }

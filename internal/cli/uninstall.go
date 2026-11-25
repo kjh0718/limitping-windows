@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 
 	"github.com/spf13/cobra"
 
@@ -112,6 +113,11 @@ func removeAlias(exe string, out io.Writer) error {
 // except a genuine collision, and none of them fail the upgrade: the binary is
 // already in place by then.
 func ensureAlias(exe string, out io.Writer) {
+	// Windows has no alias: install.sh does not run there, and an extensionless
+	// symlink is not something cmd or PowerShell can execute.
+	if runtime.GOOS == "windows" {
+		return
+	}
 	alias := filepath.Join(filepath.Dir(exe), BinaryAlias)
 
 	switch target, err := os.Readlink(alias); {
