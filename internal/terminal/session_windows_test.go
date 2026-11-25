@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -877,5 +878,181 @@ func TestSessionCtrlC(t *testing.T) {
 	}
 	if strings.Contains(out.String(), "__LIMITPING_CTRLC_RAN__") {
 		t.Fatalf("the interrupted line ran anyway; got %q", out.String())
+	}
+}
+
+// runCmdEcho runs `cmd.exe /c <line>` under Start with the given Dir/Env and
+// returns everything it rendered. cmd expands %VAR% itself, so the line shows
+// what environment and directory the child really got.
+func runCmdEcho(t *testing.T, dir string, env []string, line string) string {
+	t.Helper()
+	cmd := exec.Command(cmdExe, "/c", line)
+	cmd.Dir = dir
+	cmd.Env = env
+	sess, err := Start(context.Background(), cmd)
+	if err != nil {
+		t.Fatalf("Start = %v", err)
+	}
+	defer sess.Close()
+	out := drain(sess)
+	if err, ok := waitResult(sess, waitTimeout); !ok {
+		t.Fatal("Wait did not return")
+	} else if err != nil {
+		t.Fatalf("Wait = %v", err)
+	}
+	if !out.waitFinished(outputTimeout) {
+		t.Fatalf("output never reached EOF; got %q", out.String())
+	}
+	return out.String()
+}
+
+func TestStartAppliesDir(t *testing.T) {
+	dir := t.TempDir()
+	got := runCmdEcho(t, dir, nil, "cd")
+	if !strings.Contains(strings.ToLower(got), strings.ToLower(dir)) {
+		t.Fatalf("child did not run in %q; got %q", dir, got)
+	}
+}
+
+func TestStartAppliesEnv(t *testing.T) {
+	env := append(os.Environ(), "LIMITPING_ADDED=added-value")
+	got := runCmdEcho(t, "", env, "echo [%LIMITPING_ADDED%]")
+	if !strings.Contains(got, "[added-value]") {
+		t.Fatalf("child did not see the added variable; got %q", got)
+	}
+}
+
+// Windows names are case-insensitive, so two spellings are one variable and the
+// last assignment wins, as in os/exec.
+func TestStartEnvDuplicateKeysLastWins(t *testing.T) {
+	env := append(os.Environ(), "Limitping_Dup=first", "LIMITPING_DUP=second")
+	got := runCmdEcho(t, "", env, "echo [%limitping_dup%]")
+	if !strings.Contains(got, "[second]") || strings.Contains(got, "first") {
+		t.Fatalf("want the last duplicate to win; got %q", got)
+	}
+}
+
+func TestStartNilEnvInheritsParent(t *testing.T) {
+	t.Setenv("LIMITPING_PARENT", "from-parent")
+	got := runCmdEcho(t, "", nil, "echo [%LIMITPING_PARENT%]")
+	if !strings.Contains(got, "[from-parent]") {
+		t.Fatalf("a nil Env must inherit the parent's variables; got %q", got)
+	}
+}
+
+// A non-nil but empty Env is exactly that: nothing inherited. Only SYSTEMROOT
+// is carried over, as os/exec does.
+func TestStartEmptyEnvDoesNotInherit(t *testing.T) {
+	t.Setenv("LIMITPING_PARENT", "from-parent")
+	got := runCmdEcho(t, "", []string{}, "echo [%LIMITPING_PARENT%] [%SYSTEMROOT%]")
+	if !strings.Contains(got, "[%LIMITPING_PARENT%]") {
+		t.Fatalf("an empty Env leaked the parent's variables; got %q", got)
+	}
+	if want := "[" + os.Getenv("SYSTEMROOT") + "]"; !strings.Contains(got, want) {
+		t.Fatalf("SYSTEMROOT should still be set; want %q in %q", want, got)
+	}
+}
+
+// decodeEnvBlock splits a CreateProcess environment block back into entries.
+func decodeEnvBlock(t *testing.T, p *uint16) []string {
+	t.Helper()
+	var out []string
+	for ptr := unsafe.Pointer(p); ; {
+		var u []uint16
+		for ; *(*uint16)(ptr) != 0; ptr = unsafe.Add(ptr, 2) {
+			u = append(u, *(*uint16)(ptr))
+		}
+		ptr = unsafe.Add(ptr, 2)
+		if len(u) == 0 {
+			return out // the second NUL ends the block
+		}
+		out = append(out, windows.UTF16ToString(u))
+	}
+}
+
+func TestWindowsEnvBlock(t *testing.T) {
+	t.Setenv("SYSTEMROOT", `C:\Windows`)
+
+	if p, err := windowsEnvBlock(nil); p != nil || err != nil {
+		t.Fatalf("nil env = %v, %v; want a nil block (inherit)", p, err)
+	}
+
+	p, err := windowsEnvBlock([]string{"b=1", "A=2", "B=3", "noequals", `=C:=C:\x`, "ünï=4"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{`=C:=C:\x`, "A=2", "B=3", `SYSTEMROOT=C:\Windows`, "ünï=4"}
+	if got := decodeEnvBlock(t, p); !slices.Equal(got, want) {
+		t.Fatalf("block = %q, want %q (deduped, SYSTEMROOT added, sorted)", got, want)
+	}
+
+	// Empty with SYSTEMROOT unset still needs both terminating NULs.
+	t.Setenv("SYSTEMROOT", "")
+	p, err = windowsEnvBlock([]string{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := unsafe.Slice(p, 2); got[0] != 0 || got[1] != 0 {
+		t.Fatalf("empty block = %v, want two NULs", got)
+	}
+
+	if _, err := windowsEnvBlock([]string{"A=b\x00c"}); err == nil {
+		t.Fatal("an entry containing NUL must be rejected")
+	}
+}
+
+// ctx must govern a child built with plain exec.Command, and the kill has to go
+// through the job object (the whole tree), not cmd.Cancel, which never runs.
+func TestStartContextCancelKillsExecCommandChild(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sess, err := Start(ctx, exec.Command(cmdExe, interactiveArgs...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+	drain(sess)
+	cancel()
+	if _, ok := waitResult(sess, waitTimeout); !ok {
+		t.Fatal("cancelling ctx did not terminate the child")
+	}
+}
+
+// PrepareCommand is for plain os/exec use: a .cmd shim must receive every
+// argument as one token, quotes and cmd metacharacters included.
+func TestPrepareCommandRunsShimWithOSExec(t *testing.T) {
+	shim := writeShim(t, "dir with space", "limitping-prepare.cmd",
+		"@echo off\r\necho __ARGS__ 1=%1 2=%2 3=%3 __END__\r\n")
+
+	cmd := exec.Command(shim, "a b", `say "hi"`, "x & y | z")
+	if err := PrepareCommand(cmd); err != nil {
+		t.Fatalf("PrepareCommand = %v", err)
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Run = %v: %s", err, out)
+	}
+	// A quote inside an argument is doubled, the way quoteBatchArg documents.
+	want := `__ARGS__ 1="a b" 2="say ""hi""" 3="x & y | z" __END__`
+	if !strings.Contains(string(out), want) {
+		t.Fatalf("shim args did not arrive intact;\nwant %q\ngot  %q", want, out)
+	}
+}
+
+func TestPrepareCommandRejectsPercent(t *testing.T) {
+	shim := writeShim(t, "shim", "limitping-prepare-pct.cmd", "@echo off\r\n")
+	if err := PrepareCommand(exec.Command(shim, "%PATH%")); err == nil {
+		t.Fatal("an argument containing % cannot be passed through cmd.exe and must be rejected")
+	}
+}
+
+func TestPrepareCommandLeavesNativeImageAlone(t *testing.T) {
+	cmd := exec.Command(cmdExe, "/c", "echo hi")
+	path, args := cmd.Path, slices.Clone(cmd.Args)
+	if err := PrepareCommand(cmd); err != nil {
+		t.Fatal(err)
+	}
+	if cmd.Path != path || !slices.Equal(cmd.Args, args) || cmd.SysProcAttr != nil {
+		t.Fatalf("a native image was rewritten: %+v", cmd)
 	}
 }

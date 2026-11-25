@@ -323,7 +323,7 @@ func windowsEnvBlock(env []string) (*uint16, error) {
 		if strings.IndexByte(kv, 0) >= 0 {
 			return nil, errors.New("terminal: environment entry contains NUL")
 		}
-		// A leading '=' belongs to the name (the "=C:=C:\\" per-drive entries).
+		// A leading '=' belongs to the name (the per-drive =C:=C:\dir entries).
 		eq := strings.IndexByte(kv[min(1, len(kv)):], '=')
 		if eq < 0 {
 			continue // no value: meaningless to CreateProcess
