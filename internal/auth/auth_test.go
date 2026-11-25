@@ -179,6 +179,9 @@ func writeClaudeCreds(t *testing.T, contents string) string {
 
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	// os.UserHomeDir reads USERPROFILE on Windows, not HOME; without this the
+	// tests read (and could overwrite) the developer's real credentials.
+	t.Setenv("USERPROFILE", home)
 	dir := filepath.Join(home, ".claude")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)

@@ -29,6 +29,22 @@ jobs:
       - name: coverage summary
         run: go tool cover -func=coverage.out | tail -1
 
+  # The ConPTY backend and its tests only build on Windows, so the ubuntu job
+  # never exercises them.
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - run: go build ./...
+      - run: go vet ./...
+      # -v so the log shows the ConPTY session tests actually ran, not skipped.
+      - run: go test -count=1 -v ./...
+
   release-config:
     runs-on: ubuntu-latest
     steps:
