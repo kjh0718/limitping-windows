@@ -4,6 +4,7 @@ package terminal
 
 import (
 	"encoding/json"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -19,6 +20,11 @@ import (
 func TestBatchArgsSurviveCRTParsing(t *testing.T) {
 	node, err := exec.LookPath("node")
 	if err != nil {
+		// CI images ship node; fail there so a runner change can't silently drop
+		// this regression test.
+		if os.Getenv("CI") != "" {
+			t.Fatal("node is required in CI: it is the CRT program npm shims forward %* to")
+		}
 		t.Skip("node is not installed; it is the CRT program npm shims forward %* to")
 	}
 	quotedNode, err := quoteBatchArg(node)

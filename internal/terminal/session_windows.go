@@ -303,7 +303,8 @@ func quoteBatchArg(arg string) (string, error) {
 	// own rule: a run of them is literal unless a quote follows, where each pair
 	// collapses to one. So a run before a quote, or before the closing quote,
 	// is doubled; otherwise `C:\foo\` would swallow its closing quote and `a\"b`
-	// would lose the quote's escaping. cmd itself ignores backslashes.
+	// would lose the quote's escaping. cmd itself ignores backslashes, so a batch
+	// script reading %~1 itself (not a CRT program) sees the doubled run.
 	backslashes := 0
 	for i := 0; i < len(arg); i++ {
 		switch c := arg[i]; c {
