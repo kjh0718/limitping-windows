@@ -815,6 +815,9 @@ func triggerCodex(ctx context.Context, cfg config.ProviderConfig, dryRun bool) (
 	if err := terminal.PrepareCommand(cmd); err != nil {
 		return res, fmt.Errorf("codex exec failed to start: %w", err)
 	}
+	// On Windows the shim runs under cmd.exe, so cancelling ctx kills only cmd.exe
+	// and a grandchild can keep the output pipes open; WaitDelay bounds Run on that.
+	cmd.WaitDelay = 5 * time.Second
 	if err := cmd.Run(); err != nil {
 		return res, fmt.Errorf("codex exec failed: %w: %s", err, codexExecTail(stderr, stdout))
 	}
