@@ -101,7 +101,9 @@ binary: the Claude Code ping drives the interactive CLI through a native ConPTY
 pseudo-console, and the Codex ping runs `codex exec` headless. Both work with
 CLIs installed as `.cmd`/`.bat` shims (the usual npm install); an extra argument
 or prompt containing `%`, a NUL or a newline cannot be passed through a shim and
-is rejected. Claude credentials on macOS come from the Keychain; elsewhere they come
+is rejected. A timed-out or cancelled `codex` run (including the `codex app-server`
+call behind reset-credit redemption) is stopped together with the processes the shim
+started, and the live status line fits the console width. Claude credentials on macOS come from the Keychain; elsewhere they come
 from `~/.claude/.credentials.json`. Notifications are macOS-only.
 
 </details>
