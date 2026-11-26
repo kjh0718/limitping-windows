@@ -1,8 +1,10 @@
 package provider
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os/exec"
 	"time"
@@ -22,13 +24,39 @@ type ClaudeSession struct {
 // Busy reports whether the session is mid-turn.
 func (s ClaudeSession) Busy() bool { return s.Status == "busy" }
 
-const claudeAgentsTimeout = 5 * time.Second
+const (
+	claudeAgentsTimeout = 5 * time.Second
+	// claudeAgentsWaitDelay bounds how long Wait lingers for the output pipe once
+	// the command has exited or been cancelled: on Windows an npm claude.cmd shim
+	// runs under cmd.exe, and a descendant that outlives it can keep the pipe open
+	// indefinitely.
+	claudeAgentsWaitDelay = time.Second
+)
 
 // claudeAgentsOutput runs `claude agents --json`; tests swap it for a fake.
 var claudeAgentsOutput = func(ctx context.Context) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, claudeAgentsTimeout)
 	defer cancel()
-	return exec.CommandContext(ctx, "claude", "agents", "--json").Output()
+	var stdout bytes.Buffer
+	cmd := exec.CommandContext(ctx, "claude", "agents", "--json")
+	cmd.Stdout = &stdout
+	// On the timeout kill the shim's whole tree (Windows) rather than only its
+	// cmd.exe, and do not wait on the pipe forever if something still holds it.
+	var hold procHold
+	cmd.Cancel = func() error { return hold.kill(cmd.Process) }
+	cmd.WaitDelay = claudeAgentsWaitDelay
+	err := cmd.Start()
+	if err == nil {
+		hold.acquire(cmd.Process)
+		err = cmd.Wait()
+		hold.release()
+	}
+	// The command exited cleanly but a straggler kept the pipe open past the
+	// delay: what was written before that is the complete answer.
+	if errors.Is(err, exec.ErrWaitDelay) && cmd.ProcessState != nil && cmd.ProcessState.Success() {
+		err = nil
+	}
+	return stdout.Bytes(), err
 }
 
 // ClaudeSessions lists the live Claude Code sessions. It is Claude Code's own
