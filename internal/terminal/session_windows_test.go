@@ -1108,7 +1108,7 @@ func TestStartAttachedCancelledBeforeResumeNeverRunsChild(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if proc, err := startAttached(ctx, exec.Command(shim), nil, pty.hpc, job); !errors.Is(err, context.Canceled) {
+	if proc, _, err := startAttached(ctx, exec.Command(shim), nil, pty.hpc, job); !errors.Is(err, context.Canceled) {
 		_ = windows.CloseHandle(proc)
 		t.Fatalf("startAttached = %v, want context.Canceled", err)
 	}

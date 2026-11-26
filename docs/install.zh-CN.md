@@ -18,8 +18,8 @@ curl -fsSL https://raw.githubusercontent.com/wavever/CCLimitPing/main/install.sh
 你启用的每个 Provider 各自需要凭据：登录好的 `claude` / `codex` CLI。
 
 **Windows** 的 Release 只有 `.zip`。`install.sh` 不会在 Windows 上运行，
-`limitping upgrade` 也不会替换 Windows 上的二进制，`limitping continue` 仅支持
-Unix。见[手动下载](#手动下载)。
+`limitping upgrade` 也不会替换 Windows 上的二进制。`limitping continue` 可在 Windows
+上运行（限制见 [Windows 说明](continue.zh-CN.md)）。见[手动下载](#手动下载)。
 
 <details>
 <summary>升级</summary>
@@ -88,8 +88,8 @@ sudo mv limitping /usr/local/bin/
 
 Windows 是 `.zip`（`limitping_windows_amd64.zip`、`limitping_windows_arm64.zip`）。
 这个 zip 只适合手动解压：安装脚本会拒绝 Windows，`limitping upgrade` 会让你自己
-下载 zip，`limitping continue` 会提示暂不支持，因为它需要 Unix PTY。解压后的二进制
-可以跑 `status`、`ping`、`watch`、`schedule` 和 `bg`：Claude Code 的 ping 通过原生
+下载 zip。解压后的二进制可以跑 `status`、`ping`、`watch`、`schedule`、`bg` 和
+`continue`：Claude Code 的 ping 通过原生
 ConPTY 伪控制台驱动交互式 CLI，Codex 的 ping 以 headless 的 `codex exec` 运行。
 两者都支持以 `.cmd`/`.bat` shim 安装的 CLI（npm 安装的常见形态）；包含 `%`、NUL
 或换行的额外参数或 prompt 无法经 shim 传递，会被拒绝。超时或被取消的 `codex` 调用（包括重置额度兑换所用的 `codex app-server`）

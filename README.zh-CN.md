@@ -45,7 +45,7 @@ limitping bg start      # 在后台把窗口首尾相接
 
 - ⏱️ **窗口首尾相接** — 重置后立刻通过官方 CLI ping。
 - 🧠 **不打断你正在做的事** — CLI 钩子发现活跃会话时，让这次会话自己起算窗口。
-- 🌙 **夜里的任务自动续上** — `limitping continue codex` 在限额恢复的瞬间输入 `continue`（仅 Unix，需要 PTY）。
+- 🌙 **夜里的任务自动续上** — `limitping continue codex` 在限额恢复的瞬间输入 `continue`（支持 Unix 和 Windows；Windows 上的限制见 [docs/continue.zh-CN.md](docs/continue.zh-CN.md)）。
 - 📊 **真实的 token 和费用** — 今日 / 本周 / 本月，读本地会话记录。
 - 🎟️ **重置卡别过期作废** — 列出 Codex 重置额度与 Claude 重置卡；可在过期前打开 `auto_redeem`。
 - ⌨️ **短命令** — 每条命令都能用 `lmp`（`lmp s`、`lmp w`）。
