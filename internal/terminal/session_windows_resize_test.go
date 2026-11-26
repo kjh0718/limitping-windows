@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -206,6 +207,16 @@ func TestConPTYCloseWaitsForResizeInFlight(t *testing.T) {
 	}
 	defer func() { resizePseudoConsole = old }()
 
+	// The close is observed at its entry, not its return: ClosePseudoConsole may
+	// block for a long time, so "has it returned" cannot show it had not started.
+	closeEntered := make(chan struct{})
+	oldClose := closePseudoConsole
+	closePseudoConsole = func(h windows.Handle) {
+		close(closeEntered)
+		oldClose(h)
+	}
+	defer func() { closePseudoConsole = oldClose }()
+
 	pty, err := newConPTY(conPTYSize)
 	if err != nil {
 		t.Fatal(err)
@@ -228,8 +239,8 @@ func TestConPTYCloseWaitsForResizeInFlight(t *testing.T) {
 		t.Fatal("closeHPCON blocked its caller behind a resize in flight")
 	}
 	select {
-	case <-closed:
-		t.Fatal("ClosePseudoConsole ran while a resize was still inside ResizePseudoConsole")
+	case <-closeEntered:
+		t.Fatal("ClosePseudoConsole was entered while a resize was still inside ResizePseudoConsole")
 	case <-time.After(200 * time.Millisecond):
 	}
 	if err := pty.resize(windows.Coord{X: 90, Y: 30}); !errors.Is(err, os.ErrClosed) {
@@ -244,8 +255,38 @@ func TestConPTYCloseWaitsForResizeInFlight(t *testing.T) {
 		t.Fatalf("in-flight resize = %v", err)
 	}
 	select {
-	case <-closed:
+	case <-closeEntered:
 	case <-time.After(5 * time.Second):
 		t.Fatal("ClosePseudoConsole never ran after the resize finished")
+	}
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ClosePseudoConsole never returned")
+	}
+}
+
+func TestWin32FromHRESULT(t *testing.T) {
+	cases := []struct {
+		name string
+		in   error
+		want error
+	}{
+		{"NO_DATA as HRESULT", syscall.Errno(0x800700E8), windows.ERROR_NO_DATA},
+		{"BROKEN_PIPE as HRESULT", syscall.Errno(0x8007006D), windows.ERROR_BROKEN_PIPE},
+		{"INVALID_PARAMETER as HRESULT passes to its Win32 code", syscall.Errno(0x80070057), windows.ERROR_INVALID_PARAMETER},
+		{"plain Win32 code unchanged", windows.ERROR_NO_DATA, windows.ERROR_NO_DATA},
+		{"other facility unchanged", syscall.Errno(0x80040154), syscall.Errno(0x80040154)},
+		{"non-errno unchanged", os.ErrClosed, os.ErrClosed},
+	}
+	for _, c := range cases {
+		if got := win32FromHRESULT(c.in); got != c.want {
+			t.Errorf("%s: win32FromHRESULT(%v) = %v, want %v", c.name, c.in, got, c.want)
+		}
+	}
+	// The mapping must be what makes resize treat a dying console host as closed.
+	got := win32FromHRESULT(syscall.Errno(0x800700E8))
+	if !errors.Is(got, windows.ERROR_NO_DATA) || !(isPipeEOF(got) || errors.Is(got, windows.ERROR_NO_DATA)) {
+		t.Errorf("0x800700E8 does not reach the closed-console path: %v", got)
 	}
 }

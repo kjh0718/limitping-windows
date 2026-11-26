@@ -197,8 +197,12 @@ type conPTY struct {
 	hpcClosing atomic.Bool
 }
 
-// resizePseudoConsole is the Win32 call; a variable so a test can park it.
-var resizePseudoConsole = windows.ResizePseudoConsole
+// The Win32 pseudoconsole calls resize and close make; variables so a test can
+// park the resize and observe when the close is entered.
+var (
+	resizePseudoConsole = windows.ResizePseudoConsole
+	closePseudoConsole  = windows.ClosePseudoConsole
+)
 
 // resize changes the pseudoconsole's size, or returns os.ErrClosed once the
 // close has been started. A console host that is already gone (the child was
@@ -306,7 +310,7 @@ func (c *conPTY) closeHPCON() <-chan struct{} {
 			defer close(c.hpcDone)
 			c.hpcMu.Lock() // wait out a resize already in flight; see hpcMu
 			c.hpcMu.Unlock()
-			windows.ClosePseudoConsole(c.hpc)
+			closePseudoConsole(c.hpc)
 		}()
 	})
 	return c.hpcDone
