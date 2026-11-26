@@ -1190,3 +1190,26 @@ func TestRelativeNativePathIsResolvedAgainstDir(t *testing.T) {
 		t.Fatalf("Wait = %v, want exit status 7 from the cmd.exe copy in Dir", werr)
 	}
 }
+
+func TestExecutablePath(t *testing.T) {
+	dir := t.TempDir()
+	cases := []struct{ name, path, dir, want string }{
+		{"absolute", `C:\tools\probe.cmd`, dir, `C:\tools\probe.cmd`},
+		{"rooted backslash", `\tools\probe.cmd`, dir, `\tools\probe.cmd`},
+		{"rooted slash", `/tools/probe.cmd`, dir, `/tools/probe.cmd`},
+		{"drive relative", `C:probe.cmd`, dir, `C:probe.cmd`},
+		{"unc", `\\host\share\probe.cmd`, dir, `\\host\share\probe.cmd`},
+		{"no dir", `.\probe.cmd`, "", `.\probe.cmd`},
+		{"empty path", ``, dir, ``},
+		{"dot relative", `.\probe.cmd`, dir, filepath.Join(dir, "probe.cmd")},
+		{"sub relative", `sub\probe.cmd`, dir, filepath.Join(dir, "sub", "probe.cmd")},
+		{"parent relative", `..\probe.cmd`, filepath.Join(dir, "sub"), filepath.Join(dir, "probe.cmd")},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := executablePath(&exec.Cmd{Path: c.path, Dir: c.dir}); got != c.want {
+				t.Fatalf("executablePath(%q, Dir %q) = %q, want %q", c.path, c.dir, got, c.want)
+			}
+		})
+	}
+}

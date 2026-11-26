@@ -222,9 +222,13 @@ func prepareWindowsCommand(cmd *exec.Cmd) (appName, cmdLine string, err error) {
 // evaluated relative to Dir, whereas CreateProcess would resolve it against this
 // process's directory. The result is absolute in that case, so cmd.exe (whose own
 // directory is Dir) cannot resolve a batch script against Dir a second time.
+//
+// Only a plain relative path is joined. A rooted one (a leading \ or /) or one
+// with a drive but no root (C:probe.cmd) is not "relative to Dir" in a way a
+// join can express, so it is left as given.
 func executablePath(cmd *exec.Cmd) string {
 	p := cmd.Path
-	if cmd.Dir == "" || p == "" || filepath.IsAbs(p) || os.IsPathSeparator(p[0]) {
+	if cmd.Dir == "" || p == "" || filepath.IsAbs(p) || os.IsPathSeparator(p[0]) || filepath.VolumeName(p) != "" {
 		return p
 	}
 	joined := filepath.Join(cmd.Dir, p)
