@@ -8,7 +8,7 @@ package cli
 //
 // This file holds the platform-neutral decision logic, the usage loop, the
 // on-screen limit-message detector, and a diagnostic log; the PTY and
-// raw-terminal plumbing lives in proxy_unix.go (with a Windows stub).
+// raw-terminal plumbing lives in proxy_unix.go and proxy_windows.go.
 
 import (
 	"bytes"
@@ -279,6 +279,15 @@ func (s *sessionInjector) typeAndSubmit(msg string, settle time.Duration) {
 	_, _ = io.WriteString(s.w, msg)
 	time.Sleep(settle)
 	_, _ = io.WriteString(s.w, "\r")
+}
+
+// Write forwards the user's own keystrokes under the same lock, so a whole
+// injected message + settle + Enter is never split by typing. It cannot protect
+// text the user had already typed into the prompt before the injection.
+func (s *sessionInjector) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.Write(p)
 }
 
 // submit presses Enter, accepting whatever the TUI currently highlights.
