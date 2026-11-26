@@ -1223,3 +1223,42 @@ func TestExecutablePath(t *testing.T) {
 		})
 	}
 }
+
+// A relative script is handed to cmd.exe as given (it starts in Dir and resolves
+// the path there once). Resolving it first would put Dir's own characters into the
+// quoted script argument, where a % is refused, and a nested relative path would
+// show up if Dir were applied twice.
+func TestRelativeBatchPathInDirWithPercent(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "100%done")
+	if err := os.MkdirAll(filepath.Join(dir, "sub"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "sub", "probe.cmd"), []byte("@echo off\r\necho __IN_PCT_DIR__\r\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	newCmd := func() *exec.Cmd {
+		return &exec.Cmd{Path: `sub\probe.cmd`, Args: []string{`sub\probe.cmd`}, Dir: dir}
+	}
+
+	t.Run("Start", func(t *testing.T) {
+		sess, err := Start(context.Background(), newCmd())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer sess.Close()
+		out := drain(sess)
+		if !out.waitFor("__IN_PCT_DIR__", outputTimeout) {
+			t.Fatalf("the script did not run; got %q", out.String())
+		}
+	})
+	t.Run("PrepareCommand", func(t *testing.T) {
+		cmd := newCmd()
+		if err := PrepareCommand(cmd); err != nil {
+			t.Fatal(err)
+		}
+		out, err := cmd.CombinedOutput()
+		if err != nil || !strings.Contains(string(out), "__IN_PCT_DIR__") {
+			t.Fatalf("run = %q, %v", out, err)
+		}
+	})
+}

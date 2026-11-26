@@ -212,7 +212,10 @@ func prepareWindowsCommand(cmd *exec.Cmd) (appName, cmdLine string, err error) {
 	path := executablePath(cmd)
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".cmd", ".bat":
-		return batchCommand(path, cmd.Args[1:])
+		// The script is passed as given, not as the resolved path: cmd.exe runs in
+		// Dir and resolves a relative script there, once, and the resolved path
+		// would carry Dir's own characters (a % in it) into the quoted argument.
+		return batchCommand(cmd.Path, cmd.Args[1:])
 	default:
 		return path, windows.ComposeCommandLine(cmd.Args), nil
 	}
@@ -220,8 +223,9 @@ func prepareWindowsCommand(cmd *exec.Cmd) (appName, cmdLine string, err error) {
 
 // executablePath is cmd.Path as os/exec would run it: a relative Path is
 // evaluated relative to Dir, whereas CreateProcess would resolve it against this
-// process's directory. The result is absolute in that case, so cmd.exe (whose own
-// directory is Dir) cannot resolve a batch script against Dir a second time.
+// process's directory. It is used for a native image's lpApplicationName and to
+// recognise a batch file; a batch script itself is handed to cmd.exe as given,
+// since cmd.exe starts in Dir.
 //
 // Forms follow syscall.joinExeDirAndFName, which os/exec's own start uses:
 //   - plain relative (`probe.cmd`, `.\x\probe.cmd`): joined with Dir;
@@ -449,7 +453,7 @@ func prepareCommand(cmd *exec.Cmd) error {
 	if len(cmd.Args) == 0 {
 		return errors.New("terminal: cmd.Args is empty")
 	}
-	comspec, line, err := batchCommand(path, cmd.Args[1:])
+	comspec, line, err := batchCommand(cmd.Path, cmd.Args[1:]) // as given: see prepareWindowsCommand
 	if err != nil {
 		return err
 	}
