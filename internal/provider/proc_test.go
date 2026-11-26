@@ -10,3 +10,7 @@ func TestProcessHelpersIgnoreNil(t *testing.T) {
 		t.Fatalf("killProcessTree(nil) = %v", err)
 	}
 }
+
+func TestHoldProcessNilIsNoop(t *testing.T) {
+	holdProcess(nil)()
+}

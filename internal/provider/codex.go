@@ -819,8 +819,15 @@ func triggerCodex(ctx context.Context, cfg config.ProviderConfig, dryRun bool) (
 	// WaitDelay bounds Run if a grandchild still holds the output pipes.
 	cmd.Cancel = func() error { return killProcessTree(cmd.Process) }
 	cmd.WaitDelay = 5 * time.Second
-	if err := cmd.Run(); err != nil {
-		return res, fmt.Errorf("codex exec failed: %w: %s", err, codexExecTail(stderr, stdout))
+	// Run is Start + Wait, split so the pid can be held in between (holdProcess).
+	runErr := cmd.Start()
+	if runErr == nil {
+		release := holdProcess(cmd.Process)
+		runErr = cmd.Wait()
+		release()
+	}
+	if runErr != nil {
+		return res, fmt.Errorf("codex exec failed: %w: %s", runErr, codexExecTail(stderr, stdout))
 	}
 
 	cached, completed := codexExecUsage(stdout.Bytes(), res)

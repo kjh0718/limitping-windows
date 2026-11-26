@@ -22,3 +22,7 @@ func killProcessTree(p *os.Process) error {
 	}
 	return p.Kill()
 }
+
+// holdProcess is a no-op on Unix: os.Process.Signal/Kill already refuse to act
+// on a process that Wait has reaped, so a pid cannot be reused under them.
+func holdProcess(*os.Process) (release func()) { return func() {} }

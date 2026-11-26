@@ -74,10 +74,12 @@ func runCodexAppServer(ctx context.Context, method string, params any) (json.Raw
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("%w: %v", errCodexAppServerUnavailable, err)
 	}
+	release := holdProcess(cmd.Process)
 	defer func() {
 		_ = stdin.Close()
 		_ = terminateProcess(cmd.Process)
 		_ = cmd.Wait()
+		release() // only after Wait: a Cancel may run until then
 	}()
 
 	return codexRPCExchange(stdin, stdout, method, params)
