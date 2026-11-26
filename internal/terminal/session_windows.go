@@ -209,13 +209,29 @@ func prepareWindowsCommand(cmd *exec.Cmd) (appName, cmdLine string, err error) {
 	if len(cmd.Args) == 0 {
 		return "", "", errors.New("terminal: cmd.Args is empty")
 	}
-	path := cmd.Path
+	path := executablePath(cmd)
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".cmd", ".bat":
 		return batchCommand(path, cmd.Args[1:])
 	default:
 		return path, windows.ComposeCommandLine(cmd.Args), nil
 	}
+}
+
+// executablePath is cmd.Path as os/exec would run it: a relative Path is
+// evaluated relative to Dir, whereas CreateProcess would resolve it against this
+// process's directory. The result is absolute in that case, so cmd.exe (whose own
+// directory is Dir) cannot resolve a batch script against Dir a second time.
+func executablePath(cmd *exec.Cmd) string {
+	p := cmd.Path
+	if cmd.Dir == "" || p == "" || filepath.IsAbs(p) || os.IsPathSeparator(p[0]) {
+		return p
+	}
+	joined := filepath.Join(cmd.Dir, p)
+	if abs, err := filepath.Abs(joined); err == nil {
+		return abs
+	}
+	return joined
 }
 
 // batchCommand builds the interpreter invocation that runs a .cmd/.bat script.
@@ -402,7 +418,7 @@ func prepareCommand(cmd *exec.Cmd) error {
 	if cmd.Err != nil {
 		return nil // os/exec reports it from Run
 	}
-	path := cmd.Path
+	path := executablePath(cmd)
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".cmd", ".bat":
 	default:

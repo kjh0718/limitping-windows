@@ -1117,3 +1117,76 @@ func TestStartAttachedCancelledBeforeResumeNeverRunsChild(t *testing.T) {
 		t.Fatal("the suspended child was resumed although ctx was cancelled")
 	}
 }
+
+// os/exec evaluates a relative Path relative to Dir; the manual CreateProcess
+// path and PrepareCommand must agree instead of resolving against our cwd.
+func TestRelativePathIsResolvedAgainstDir(t *testing.T) {
+	dirA, dirB := t.TempDir(), t.TempDir()
+	for dir, marker := range map[string]string{dirA: "FROM_DIR", dirB: "FROM_PARENT"} {
+		body := "@echo off\r\necho __" + marker + "__\r\n"
+		if err := os.WriteFile(filepath.Join(dir, "probe.cmd"), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Chdir(dirB) // the decoy: where a wrongly resolved `.\probe.cmd` would be found
+	newCmd := func() *exec.Cmd {
+		return &exec.Cmd{Path: `.\probe.cmd`, Args: []string{`.\probe.cmd`}, Dir: dirA}
+	}
+
+	t.Run("Start", func(t *testing.T) {
+		sess, err := Start(context.Background(), newCmd())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer sess.Close()
+		out := drain(sess)
+		if !out.waitFor("__FROM_DIR__", outputTimeout) {
+			t.Fatalf("the script in Dir did not run; got %q", out.String())
+		}
+	})
+	t.Run("PrepareCommand", func(t *testing.T) {
+		cmd := newCmd()
+		if err := PrepareCommand(cmd); err != nil {
+			t.Fatal(err)
+		}
+		out, err := cmd.CombinedOutput()
+		if err != nil || !strings.Contains(string(out), "__FROM_DIR__") {
+			t.Fatalf("PrepareCommand run = %q, %v; want the script in Dir", out, err)
+		}
+	})
+}
+
+// The same for a native image, the case where CreateProcess's lpApplicationName
+// really is resolved against our directory (a batch script is found by cmd.exe,
+// whose own directory is Dir). The same-named probe.exe is cmd.exe in Dir and
+// hostname.exe in the parent directory; only cmd.exe turns `/c exit 7` into
+// exit status 7, which is read from Wait since ConPTY output is not reliable text.
+func TestRelativeNativePathIsResolvedAgainstDir(t *testing.T) {
+	dirA, dirB := t.TempDir(), t.TempDir()
+	sys32 := filepath.Join(os.Getenv("SystemRoot"), "System32")
+	for dir, exe := range map[string]string{dirA: "cmd.exe", dirB: "hostname.exe"} {
+		data, err := os.ReadFile(filepath.Join(sys32, exe))
+		if err != nil {
+			t.Skipf("%s unavailable: %v", exe, err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "probe.exe"), data, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Chdir(dirB)
+
+	sess, err := Start(context.Background(), &exec.Cmd{
+		Path: `.\probe.exe`, Args: []string{`.\probe.exe`, "/c", "exit 7"}, Dir: dirA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+	drain(sess)
+	werr, ok := waitResult(sess, waitTimeout)
+	if !ok {
+		t.Fatal("Wait did not return")
+	}
+	if werr == nil || !strings.Contains(werr.Error(), "exit status 7") {
+		t.Fatalf("Wait = %v, want exit status 7 from the cmd.exe copy in Dir", werr)
+	}
+}
