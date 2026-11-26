@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/creack/pty"
+	"golang.org/x/term"
 )
 
 // heartbeatFrames is an ASCII ECG-style pulse that shows the watcher is alive
@@ -323,9 +323,10 @@ func terminalWidth(out io.Writer) int {
 	if !ok {
 		return 0
 	}
-	_, cols, err := pty.Getsize(f)
+	// term.GetSize returns (width, height); it also works on Windows consoles.
+	width, _, err := term.GetSize(int(f.Fd()))
 	if err != nil {
 		return 0
 	}
-	return cols
+	return width
 }

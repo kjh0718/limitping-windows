@@ -1072,3 +1072,193 @@ func TestEmptyArgsIsAnErrorNotAPanic(t *testing.T) {
 		t.Fatal("PrepareCommand accepted a batch cmd with no Args")
 	}
 }
+
+// A ctx that is already done must not run the child at all (the contract
+// exec.CommandContext has), and must not leave a session behind.
+func TestStartCancelledContextNeverRunsChild(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "ran")
+	shim := writeShim(t, "shim", "limitping-marker.cmd", "@echo off\r\necho x> \""+marker+"\"\r\n")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	sess, err := Start(ctx, exec.Command(shim))
+	if sess != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("Start = (%v, %v), want (nil, context.Canceled)", sess, err)
+	}
+	time.Sleep(time.Second)
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("the child ran although ctx was already cancelled")
+	}
+}
+
+// ctx ending after the child is created but before it is resumed (the window the
+// up-front check cannot cover) must tear the suspended child down unrun.
+func TestStartAttachedCancelledBeforeResumeNeverRunsChild(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "ran")
+	shim := writeShim(t, "shim", "limitping-marker.cmd", "@echo off\r\necho x> \""+marker+"\"\r\n")
+	pty, err := newConPTY(conPTYSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pty.teardown()
+	job, err := newJobObject()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer job.close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if proc, err := startAttached(ctx, exec.Command(shim), nil, pty.hpc, job); !errors.Is(err, context.Canceled) {
+		_ = windows.CloseHandle(proc)
+		t.Fatalf("startAttached = %v, want context.Canceled", err)
+	}
+	time.Sleep(time.Second)
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("the suspended child was resumed although ctx was cancelled")
+	}
+}
+
+// os/exec evaluates a relative Path relative to Dir; the manual CreateProcess
+// path and PrepareCommand must agree instead of resolving against our cwd.
+func TestRelativePathIsResolvedAgainstDir(t *testing.T) {
+	dirA, dirB := t.TempDir(), t.TempDir()
+	for dir, marker := range map[string]string{dirA: "FROM_DIR", dirB: "FROM_PARENT"} {
+		body := "@echo off\r\necho __" + marker + "__\r\n"
+		if err := os.WriteFile(filepath.Join(dir, "probe.cmd"), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Chdir(dirB) // the decoy: where a wrongly resolved `.\probe.cmd` would be found
+	newCmd := func() *exec.Cmd {
+		return &exec.Cmd{Path: `.\probe.cmd`, Args: []string{`.\probe.cmd`}, Dir: dirA}
+	}
+
+	t.Run("Start", func(t *testing.T) {
+		sess, err := Start(context.Background(), newCmd())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer sess.Close()
+		out := drain(sess)
+		if !out.waitFor("__FROM_DIR__", outputTimeout) {
+			t.Fatalf("the script in Dir did not run; got %q", out.String())
+		}
+	})
+	t.Run("PrepareCommand", func(t *testing.T) {
+		cmd := newCmd()
+		if err := PrepareCommand(cmd); err != nil {
+			t.Fatal(err)
+		}
+		out, err := cmd.CombinedOutput()
+		if err != nil || !strings.Contains(string(out), "__FROM_DIR__") {
+			t.Fatalf("PrepareCommand run = %q, %v; want the script in Dir", out, err)
+		}
+	})
+}
+
+// The same for a native image, the case where CreateProcess's lpApplicationName
+// really is resolved against our directory (a batch script is found by cmd.exe,
+// whose own directory is Dir). The same-named probe.exe is cmd.exe in Dir and
+// hostname.exe in the parent directory; only cmd.exe turns `/c exit 7` into
+// exit status 7, which is read from Wait since ConPTY output is not reliable text.
+func TestRelativeNativePathIsResolvedAgainstDir(t *testing.T) {
+	dirA, dirB := t.TempDir(), t.TempDir()
+	sys32 := filepath.Join(os.Getenv("SystemRoot"), "System32")
+	for dir, exe := range map[string]string{dirA: "cmd.exe", dirB: "hostname.exe"} {
+		data, err := os.ReadFile(filepath.Join(sys32, exe))
+		if err != nil {
+			t.Skipf("%s unavailable: %v", exe, err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "probe.exe"), data, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Chdir(dirB)
+
+	sess, err := Start(context.Background(), &exec.Cmd{
+		Path: `.\probe.exe`, Args: []string{`.\probe.exe`, "/c", "exit 7"}, Dir: dirA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+	drain(sess)
+	werr, ok := waitResult(sess, waitTimeout)
+	if !ok {
+		t.Fatal("Wait did not return")
+	}
+	if werr == nil || !strings.Contains(werr.Error(), "exit status 7") {
+		t.Fatalf("Wait = %v, want exit status 7 from the cmd.exe copy in Dir", werr)
+	}
+}
+
+// The expected forms follow syscall.joinExeDirAndFName (what os/exec itself uses).
+func TestExecutablePath(t *testing.T) {
+	const dir = `C:\work\proj`
+	const unc = `\\host\share\proj`
+	cases := []struct{ name, path, dir, want string }{
+		{"absolute", `C:\tools\probe.cmd`, dir, `C:\tools\probe.cmd`},
+		{"absolute other drive", `D:\tools\probe.cmd`, dir, `D:\tools\probe.cmd`},
+		{"unc path", `\\host\share\probe.cmd`, dir, `\\host\share\probe.cmd`},
+		{"no dir", `.\probe.cmd`, "", `.\probe.cmd`},
+		{"empty path", ``, dir, ``},
+		{"dot relative", `.\probe.cmd`, dir, `C:\work\proj\probe.cmd`},
+		{"sub relative", `sub\probe.cmd`, dir, `C:\work\proj\sub\probe.cmd`},
+		{"parent relative", `..\probe.cmd`, dir, `C:\work\probe.cmd`},
+		{"relative in unc dir", `probe.cmd`, unc, `\\host\share\proj\probe.cmd`},
+		{"rooted backslash gets dir drive", `\tools\probe.cmd`, dir, `C:\tools\probe.cmd`},
+		{"rooted slash gets dir drive", `/tools/probe.cmd`, dir, `C:\tools\probe.cmd`},
+		{"rooted in unc dir gets share", `\tools\probe.cmd`, unc, `\\host\share\tools\probe.cmd`},
+		{"rooted with drive-less dir", `\tools\probe.cmd`, `proj`, `\tools\probe.cmd`},
+		{"drive relative same drive", `C:probe.cmd`, dir, `C:\work\proj\probe.cmd`},
+		{"drive relative same drive other case", `c:sub\probe.cmd`, dir, `C:\work\proj\sub\probe.cmd`},
+		{"drive relative other drive", `D:probe.cmd`, dir, `D:probe.cmd`},
+		{"drive relative with unc dir", `C:probe.cmd`, unc, `C:probe.cmd`},
+		{"bare drive", `C:`, dir, `C:`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := executablePath(&exec.Cmd{Path: c.path, Dir: c.dir}); got != c.want {
+				t.Fatalf("executablePath(%q, Dir %q) = %q, want %q", c.path, c.dir, got, c.want)
+			}
+		})
+	}
+}
+
+// A relative script is handed to cmd.exe as given (it starts in Dir and resolves
+// the path there once). Resolving it first would put Dir's own characters into the
+// quoted script argument, where a % is refused, and a nested relative path would
+// show up if Dir were applied twice.
+func TestRelativeBatchPathInDirWithPercent(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "100%done")
+	if err := os.MkdirAll(filepath.Join(dir, "sub"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "sub", "probe.cmd"), []byte("@echo off\r\necho __IN_PCT_DIR__\r\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	newCmd := func() *exec.Cmd {
+		return &exec.Cmd{Path: `sub\probe.cmd`, Args: []string{`sub\probe.cmd`}, Dir: dir}
+	}
+
+	t.Run("Start", func(t *testing.T) {
+		sess, err := Start(context.Background(), newCmd())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer sess.Close()
+		out := drain(sess)
+		if !out.waitFor("__IN_PCT_DIR__", outputTimeout) {
+			t.Fatalf("the script did not run; got %q", out.String())
+		}
+	})
+	t.Run("PrepareCommand", func(t *testing.T) {
+		cmd := newCmd()
+		if err := PrepareCommand(cmd); err != nil {
+			t.Fatal(err)
+		}
+		out, err := cmd.CombinedOutput()
+		if err != nil || !strings.Contains(string(out), "__IN_PCT_DIR__") {
+			t.Fatalf("run = %q, %v", out, err)
+		}
+	})
+}

@@ -9,7 +9,6 @@ import (
 	"io"
 	"os/exec"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -54,12 +53,16 @@ type codexRPCMessage struct {
 	Error  *codexRPCError  `json:"error"`
 }
 
+// codexBinary is the executable runCodexAppServer starts; tests point it at a fake.
+var codexBinary = "codex"
+
 // runCodexAppServer starts `codex app-server`, performs the initialize
 // handshake, sends method with params and returns the result. Notifications the
 // server pushes meanwhile are skipped.
 func runCodexAppServer(ctx context.Context, method string, params any) (json.RawMessage, error) {
-	cmd := exec.CommandContext(ctx, "codex", "app-server")
-	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
+	cmd := exec.CommandContext(ctx, codexBinary, "app-server")
+	var hold procHold
+	cmd.Cancel = func() error { return hold.terminate(cmd.Process) }
 	cmd.WaitDelay = 2 * time.Second
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -72,12 +75,12 @@ func runCodexAppServer(ctx context.Context, method string, params any) (json.Raw
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("%w: %v", errCodexAppServerUnavailable, err)
 	}
+	hold.acquire(cmd.Process)
 	defer func() {
 		_ = stdin.Close()
-		if cmd.Process != nil {
-			_ = cmd.Process.Signal(syscall.SIGTERM)
-		}
+		_ = hold.terminate(cmd.Process)
 		_ = cmd.Wait()
+		hold.release() // only after Wait: a Cancel may run until then
 	}()
 
 	return codexRPCExchange(stdin, stdout, method, params)

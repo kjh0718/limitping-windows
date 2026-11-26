@@ -54,7 +54,7 @@ func start(ctx context.Context, cmd *exec.Cmd) (Session, error) {
 		pty.teardown()
 		return nil, err
 	}
-	proc, err := startAttached(cmd, envBlock, pty.hpc, job)
+	proc, err := startAttached(ctx, cmd, envBlock, pty.hpc, job)
 	if err != nil {
 		// Closing the job kills anything that did get assigned to it.
 		_ = job.close()
@@ -96,7 +96,7 @@ func start(ctx context.Context, cmd *exec.Cmd) (Session, error) {
 // maintainers recommend for a ConPTY parent whose own output is redirected. It
 // is also why handle inheritance stays off: nothing is being handed down, and
 // the pseudoconsole duplicates the pipe ends it needs by itself.
-func startAttached(cmd *exec.Cmd, envBlock *uint16, hpc windows.Handle, job *jobObject) (windows.Handle, error) {
+func startAttached(ctx context.Context, cmd *exec.Cmd, envBlock *uint16, hpc windows.Handle, job *jobObject) (windows.Handle, error) {
 	attrs, err := windows.NewProcThreadAttributeList(1)
 	if err != nil {
 		return 0, fmt.Errorf("NewProcThreadAttributeList: %w", err)
@@ -171,6 +171,14 @@ func startAttached(cmd *exec.Cmd, envBlock *uint16, hpc windows.Handle, job *job
 		_ = windows.CloseHandle(pi.Process)
 		return 0, err
 	}
+	// ctx may have ended while the child was being set up. It is still suspended
+	// and has run nothing, so tear it down instead of letting it start.
+	if err := ctx.Err(); err != nil {
+		_ = windows.TerminateProcess(pi.Process, 1)
+		_ = windows.CloseHandle(pi.Thread)
+		_ = windows.CloseHandle(pi.Process)
+		return 0, err
+	}
 	if _, err := windows.ResumeThread(pi.Thread); err != nil {
 		_ = windows.TerminateProcess(pi.Process, 1)
 		_ = windows.CloseHandle(pi.Thread)
@@ -201,12 +209,55 @@ func prepareWindowsCommand(cmd *exec.Cmd) (appName, cmdLine string, err error) {
 	if len(cmd.Args) == 0 {
 		return "", "", errors.New("terminal: cmd.Args is empty")
 	}
-	switch strings.ToLower(filepath.Ext(cmd.Path)) {
+	path := executablePath(cmd)
+	switch strings.ToLower(filepath.Ext(path)) {
 	case ".cmd", ".bat":
+		// The script is passed as given, not as the resolved path: cmd.exe runs in
+		// Dir and resolves a relative script there, once, and the resolved path
+		// would carry Dir's own characters (a % in it) into the quoted argument.
 		return batchCommand(cmd.Path, cmd.Args[1:])
 	default:
-		return cmd.Path, windows.ComposeCommandLine(cmd.Args), nil
+		return path, windows.ComposeCommandLine(cmd.Args), nil
 	}
+}
+
+// executablePath is cmd.Path as os/exec would run it: a relative Path is
+// evaluated relative to Dir, whereas CreateProcess would resolve it against this
+// process's directory. It is used for a native image's lpApplicationName and to
+// recognise a batch file; a batch script itself is handed to cmd.exe as given,
+// since cmd.exe starts in Dir.
+//
+// Forms follow syscall.joinExeDirAndFName, which os/exec's own start uses:
+//   - plain relative (`probe.cmd`, `.\x\probe.cmd`): joined with Dir;
+//   - rooted without a drive (`\x`, `/x`): Dir's volume is put in front of it;
+//   - a drive without a root (`C:probe.cmd`): joined with Dir when Dir is on the
+//     same drive (case-insensitive), otherwise left as given;
+//   - absolute and UNC paths: left as given.
+func executablePath(cmd *exec.Cmd) string {
+	p, dir := cmd.Path, cmd.Dir
+	if dir == "" || p == "" || filepath.IsAbs(p) {
+		return p
+	}
+	abs := func(s string) string {
+		if a, err := filepath.Abs(s); err == nil {
+			return a
+		}
+		return s
+	}
+	dirVol := filepath.VolumeName(dir)
+	if vol := filepath.VolumeName(p); vol != "" {
+		if rest := p[len(vol):]; rest != "" && strings.EqualFold(vol, dirVol) {
+			return abs(filepath.Join(dir, rest))
+		}
+		return p
+	}
+	if os.IsPathSeparator(p[0]) {
+		if dirVol == "" {
+			return p
+		}
+		return filepath.Clean(dirVol + p)
+	}
+	return abs(filepath.Join(dir, p))
 }
 
 // batchCommand builds the interpreter invocation that runs a .cmd/.bat script.
@@ -393,7 +444,8 @@ func prepareCommand(cmd *exec.Cmd) error {
 	if cmd.Err != nil {
 		return nil // os/exec reports it from Run
 	}
-	switch strings.ToLower(filepath.Ext(cmd.Path)) {
+	path := executablePath(cmd)
+	switch strings.ToLower(filepath.Ext(path)) {
 	case ".cmd", ".bat":
 	default:
 		return nil
@@ -401,7 +453,7 @@ func prepareCommand(cmd *exec.Cmd) error {
 	if len(cmd.Args) == 0 {
 		return errors.New("terminal: cmd.Args is empty")
 	}
-	comspec, line, err := batchCommand(cmd.Path, cmd.Args[1:])
+	comspec, line, err := batchCommand(cmd.Path, cmd.Args[1:]) // as given: see prepareWindowsCommand
 	if err != nil {
 		return err
 	}

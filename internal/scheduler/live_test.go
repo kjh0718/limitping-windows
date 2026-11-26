@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"bytes"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -155,5 +156,19 @@ func TestLiveStatusRender(t *testing.T) {
 	}
 	if !l.drawn {
 		t.Error("drawLocked should mark the line as drawn")
+	}
+}
+
+func TestTerminalWidthUnknownIsZero(t *testing.T) {
+	if got := terminalWidth(&bytes.Buffer{}); got != 0 {
+		t.Fatalf("non-file writer width = %d, want 0", got)
+	}
+	f, err := os.CreateTemp(t.TempDir(), "out")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if got := terminalWidth(f); got != 0 {
+		t.Fatalf("regular file width = %d, want 0", got)
 	}
 }
