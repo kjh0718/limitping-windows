@@ -9,6 +9,8 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -184,23 +186,53 @@ type conPTY struct {
 	hpcOnce sync.Once
 	hpcDone chan struct{}
 
-	// hpcMu guards hpcClosed and is held across the whole ResizePseudoConsole
-	// call: ClosePseudoConsole frees the HPCON, so a resize running against it
-	// would be a use-after-free. closeHPCON takes it to set hpcClosed before the
-	// close starts; the close itself runs outside the lock.
-	hpcMu     sync.Mutex
-	hpcClosed bool
+	// hpcClosing is set, synchronously, as soon as the close is requested.
+	// hpcMu is held across the whole ResizePseudoConsole call, and the close
+	// goroutine passes through it before ClosePseudoConsole frees the HPCON: a
+	// resize in flight finishes first, and one that starts later sees hpcClosing
+	// (re-checked under the lock) and never touches the freed handle. The closer
+	// only waits behind a resize inside its own goroutine, so a stuck resize can
+	// delay the console close but never the waiter or Close.
+	hpcMu      sync.Mutex
+	hpcClosing atomic.Bool
 }
 
+// resizePseudoConsole is the Win32 call; a variable so a test can park it.
+var resizePseudoConsole = windows.ResizePseudoConsole
+
 // resize changes the pseudoconsole's size, or returns os.ErrClosed once the
-// close has been started.
+// close has been started. A console host that is already gone (the child was
+// killed and the waiter has not reached closeHPCON yet) fails the call with a
+// broken-pipe or "pipe is being closed" status; that is the same "console is
+// gone" outcome, so it maps to os.ErrClosed too.
 func (c *conPTY) resize(size windows.Coord) error {
-	c.hpcMu.Lock()
-	defer c.hpcMu.Unlock()
-	if c.hpcClosed {
+	if c.hpcClosing.Load() {
 		return os.ErrClosed
 	}
-	return windows.ResizePseudoConsole(c.hpc, size)
+	c.hpcMu.Lock()
+	defer c.hpcMu.Unlock()
+	if c.hpcClosing.Load() {
+		return os.ErrClosed
+	}
+	if err := resizePseudoConsole(c.hpc, size); err != nil {
+		err = win32FromHRESULT(err)
+		if isPipeEOF(err) || errors.Is(err, windows.ERROR_NO_DATA) {
+			return os.ErrClosed
+		}
+		return err
+	}
+	return nil
+}
+
+// win32FromHRESULT turns an HRESULT_FROM_WIN32 value, which is how the
+// pseudoconsole calls report failures (e.g. 0x800700E8), back into the plain
+// Win32 error code so it can be compared with the windows.ERROR_* constants.
+func win32FromHRESULT(err error) error {
+	var errno syscall.Errno
+	if errors.As(err, &errno) && uint32(errno)&0xFFFF0000 == 0x80070000 {
+		return syscall.Errno(uint32(errno) & 0xFFFF)
+	}
+	return err
 }
 
 // newConPTY creates a pseudoconsole of the given size and returns the parent
@@ -269,11 +301,11 @@ func newConPTY(size windows.Coord) (*conPTY, error) {
 // has drained.
 func (c *conPTY) closeHPCON() <-chan struct{} {
 	c.hpcOnce.Do(func() {
-		c.hpcMu.Lock()
-		c.hpcClosed = true
-		c.hpcMu.Unlock()
+		c.hpcClosing.Store(true)
 		go func() {
 			defer close(c.hpcDone)
+			c.hpcMu.Lock() // wait out a resize already in flight; see hpcMu
+			c.hpcMu.Unlock()
 			windows.ClosePseudoConsole(c.hpc)
 		}()
 	})

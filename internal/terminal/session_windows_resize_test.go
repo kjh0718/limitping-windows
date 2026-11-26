@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -186,5 +187,65 @@ func TestSessionConcurrentResizeWaitClose(t *testing.T) {
 		if err := sess.Resize(80, 24); !errors.Is(err, os.ErrClosed) {
 			t.Fatalf("iteration %d: Resize after close = %v, want os.ErrClosed", i, err)
 		}
+	}
+}
+
+// The close of the pseudoconsole must wait for a resize that is already inside
+// ResizePseudoConsole (the call would otherwise run on a freed HPCON), must not
+// make the closer's caller wait for it, and must turn later resizes away.
+func TestConPTYCloseWaitsForResizeInFlight(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	var calls int32
+	old := resizePseudoConsole
+	resizePseudoConsole = func(windows.Handle, windows.Coord) error {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			close(entered)
+			<-release
+		}
+		return nil
+	}
+	defer func() { resizePseudoConsole = old }()
+
+	pty, err := newConPTY(conPTYSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pty.teardown()
+	var releaseOnce sync.Once
+	releaseResize := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseResize() // runs before teardown, so a failing test cannot hang on the parked resize
+
+	resizeDone := make(chan error, 1)
+	go func() { resizeDone <- pty.resize(windows.Coord{X: 100, Y: 40}) }()
+	<-entered
+
+	returned := make(chan (<-chan struct{}), 1)
+	go func() { returned <- pty.closeHPCON() }()
+	var closed <-chan struct{}
+	select {
+	case closed = <-returned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("closeHPCON blocked its caller behind a resize in flight")
+	}
+	select {
+	case <-closed:
+		t.Fatal("ClosePseudoConsole ran while a resize was still inside ResizePseudoConsole")
+	case <-time.After(200 * time.Millisecond):
+	}
+	if err := pty.resize(windows.Coord{X: 90, Y: 30}); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("resize after the close was requested = %v, want os.ErrClosed", err)
+	}
+	if n := atomic.LoadInt32(&calls); n != 1 {
+		t.Fatalf("ResizePseudoConsole called %d times, want only the in-flight one", n)
+	}
+
+	releaseResize()
+	if err := <-resizeDone; err != nil {
+		t.Fatalf("in-flight resize = %v", err)
+	}
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ClosePseudoConsole never ran after the resize finished")
 	}
 }
