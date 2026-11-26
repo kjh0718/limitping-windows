@@ -66,7 +66,10 @@ func runContinueProxy(ctx context.Context, out io.Writer, providerName string, e
 	// among them while stdin is a console: raw mode (ENABLE_PROCESSED_INPUT off)
 	// delivers it to the child as a byte, which is what an interactive CLI
 	// expects. Window close is only a best-effort chance to restore the console:
-	// Windows ends the process shortly after the handler returns.
+	// while a SIGTERM Notify is registered Go's console handler blocks instead of
+	// returning, which buys this goroutine time to run, but the real bound is
+	// Windows' own close timeout (about 5 s), after which it terminates the
+	// process whether or not the restore has run.
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGTERM, os.Interrupt)
 	defer stop()
 	// cancel lets the output pump end the session when stdout breaks.
@@ -136,12 +139,14 @@ func runContinueProxy(ctx context.Context, out io.Writer, providerName string, e
 	}()
 
 	resizeStop, resizeDone := make(chan struct{}), make(chan struct{})
-	if cols > 0 {
+	if stdoutConsole {
+		// Started even when the initial size lookup failed (cols == 0): the next
+		// successful poll then sizes the session.
 		go func() {
 			defer close(resizeDone)
 			watchResize(resizeStop, proxyResizePoll, cols, rows, func() (int, int, error) {
 				return term.GetSize(int(os.Stdout.Fd()))
-			}, sess.Resize)
+			}, sess.Resize, lg.logf)
 		}()
 	} else {
 		close(resizeDone)
@@ -167,6 +172,11 @@ func runContinueProxy(ctx context.Context, out io.Writer, providerName string, e
 	close(resizeStop)
 	waitClosed(resizeDone, proxyStopTimeout)
 	_ = sess.Close()
+	// A console write that is already in progress cannot be interrupted, so this
+	// wait is bounded. If it expires the console is restored anyway: leaving the
+	// user's console raw with VT processing forced on is worse than the chance of
+	// a few trailing VT bytes of the child's output landing after the restore,
+	// which is accepted.
 	if !waitClosed(outDone, proxyStopTimeout) {
 		lg.logf("output pump still running at shutdown")
 	}
@@ -259,10 +269,21 @@ func enableVTMode(h windows.Handle, get func(windows.Handle, *uint32) error, set
 // the last size the pseudoconsole was given (cols x rows to begin with). A size
 // that is unreadable, empty (a minimized window) or that resize rejected is not
 // recorded, so the next tick tries again. It returns when done closes or when
-// resize reports os.ErrClosed.
-func watchResize(done <-chan struct{}, interval time.Duration, cols, rows int, size func() (int, int, error), resize func(cols, rows int) error) {
+// resize reports os.ErrClosed. A failure other than that is reported through logf
+// (when set) once, again only if its message changes or after a success, so a
+// persistent error cannot flood the log at the poll rate.
+func watchResize(done <-chan struct{}, interval time.Duration, cols, rows int, size func() (int, int, error), resize func(cols, rows int) error, logf func(format string, args ...any)) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
+	lastErr := ""
+	report := func(what string, err error) {
+		if msg := what + ": " + err.Error(); msg != lastErr {
+			lastErr = msg
+			if logf != nil {
+				logf("resize watcher: %s", msg)
+			}
+		}
+	}
 	for {
 		select {
 		case <-done:
@@ -270,15 +291,21 @@ func watchResize(done <-chan struct{}, interval time.Duration, cols, rows int, s
 		case <-t.C:
 		}
 		c, r, err := size()
-		if err != nil || c < 1 || r < 1 || (c == cols && r == rows) {
+		if err != nil {
+			report("reading the console size", err)
+			continue
+		}
+		if c < 1 || r < 1 || (c == cols && r == rows) {
 			continue
 		}
 		if err := resize(c, r); err != nil {
 			if errors.Is(err, os.ErrClosed) {
 				return
 			}
+			report(fmt.Sprintf("resizing to %dx%d", c, r), err)
 			continue
 		}
+		lastErr = ""
 		cols, rows = c, r
 	}
 }

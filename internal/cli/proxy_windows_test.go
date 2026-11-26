@@ -5,6 +5,7 @@ package cli
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -68,7 +69,7 @@ func runWatchResize(t *testing.T, d time.Duration, cols, rows int, size func() (
 	finished := make(chan struct{})
 	go func() {
 		defer close(finished)
-		watchResize(done, time.Millisecond, cols, rows, size, rec.resize)
+		watchResize(done, time.Millisecond, cols, rows, size, rec.resize, nil)
 	}()
 	time.Sleep(d)
 	close(done)
@@ -116,7 +117,7 @@ func TestWatchResizeStopsOnErrClosed(t *testing.T) {
 	finished := make(chan struct{})
 	go func() {
 		defer close(finished)
-		watchResize(done, time.Millisecond, 80, 24, scriptedSize([]sizeStep{{100, 30, nil}}), rec.resize)
+		watchResize(done, time.Millisecond, 80, 24, scriptedSize([]sizeStep{{100, 30, nil}}), rec.resize, nil)
 	}()
 	select {
 	case <-finished:
@@ -125,6 +126,82 @@ func TestWatchResizeStopsOnErrClosed(t *testing.T) {
 	}
 	if got := rec.snapshot(); len(got) != 1 {
 		t.Fatalf("resize calls = %v, want a single call before stopping", got)
+	}
+}
+
+// A session that started without a known size (the initial lookup failed) is
+// sized by the first poll that works.
+func TestWatchResizeSizesASessionThatStartedWithoutOne(t *testing.T) {
+	rec := &resizeRecorder{}
+	runWatchResize(t, 100*time.Millisecond, 0, 0, scriptedSize([]sizeStep{{0, 0, errors.New("no console yet")}, {110, 33, nil}}), rec)
+	if got := rec.snapshot(); len(got) != 1 || got[0] != (resizeCall{110, 33}) {
+		t.Fatalf("resize calls = %v, want [{110 33}]", got)
+	}
+}
+
+type logRecorder struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (l *logRecorder) logf(format string, args ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lines = append(l.lines, fmt.Sprintf(format, args...))
+}
+
+func (l *logRecorder) snapshot() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.lines...)
+}
+
+// A persistent failure is logged once; a different failure, or the same one after
+// a success, is logged again.
+func TestWatchResizeLogsFailureKindsOnce(t *testing.T) {
+	rec := &resizeRecorder{errs: []error{errors.New("A"), errors.New("A"), errors.New("A"), errors.New("B"), errors.New("B"), nil, errors.New("A")}}
+	lr := &logRecorder{}
+	done := make(chan struct{})
+	finished := make(chan struct{})
+	// Different sizes every poll so each tick really calls resize.
+	var n int
+	var mu sync.Mutex
+	size := func() (int, int, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		n++
+		return 100 + n, 30, nil
+	}
+	go func() {
+		defer close(finished)
+		watchResize(done, time.Millisecond, 80, 24, size, rec.resize, lr.logf)
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for len(rec.snapshot()) < 8 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	close(done)
+	<-finished
+
+	lines := lr.snapshot()
+	if len(lines) != 3 || !strings.HasSuffix(lines[0], ": A") || !strings.HasSuffix(lines[1], ": B") || !strings.HasSuffix(lines[2], ": A") {
+		t.Fatalf("log lines = %q, want one each for A, B, and A again after a success", lines)
+	}
+}
+
+func TestWatchResizeLogsUnreadableSizeOnce(t *testing.T) {
+	lr := &logRecorder{}
+	done := make(chan struct{})
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		watchResize(done, time.Millisecond, 80, 24, scriptedSize([]sizeStep{{0, 0, errors.New("no screen buffer")}}), (&resizeRecorder{}).resize, lr.logf)
+	}()
+	time.Sleep(100 * time.Millisecond)
+	close(done)
+	<-finished
+	if lines := lr.snapshot(); len(lines) != 1 {
+		t.Fatalf("log lines = %q, want exactly one", lines)
 	}
 }
 

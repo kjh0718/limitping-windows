@@ -6,34 +6,43 @@ import (
 	"time"
 )
 
+// recordingWriter signals on its first write, so a test can act exactly while the
+// injector is inside its settle pause instead of guessing at timing.
 type recordingWriter struct {
 	mu     sync.Mutex
 	writes []string
+	first  chan struct{}
+	once   sync.Once
 }
 
 func (w *recordingWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
-	defer w.mu.Unlock()
 	w.writes = append(w.writes, string(p))
+	w.mu.Unlock()
+	w.once.Do(func() { close(w.first) })
 	return len(p), nil
 }
 
 // The user's own keystrokes must not land between an injected message and its
 // Enter, or the submitted line would be corrupted.
 func TestSessionInjectorSerializesUserInput(t *testing.T) {
-	w := &recordingWriter{}
+	w := &recordingWriter{first: make(chan struct{})}
 	inj := &sessionInjector{w: w}
 
-	injecting := make(chan struct{})
+	injected := make(chan struct{})
 	go func() {
-		close(injecting)
+		defer close(injected)
 		inj.typeAndSubmit("MSG", 150*time.Millisecond)
 	}()
-	<-injecting
-	time.Sleep(50 * time.Millisecond) // inside the settle pause
+	select {
+	case <-w.first: // "MSG" is written; the injector now sits in its settle pause
+	case <-time.After(5 * time.Second):
+		t.Fatal("the injector never wrote its message")
+	}
 	if _, err := inj.Write([]byte("x")); err != nil {
 		t.Fatalf("Write = %v", err)
 	}
+	<-injected
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
