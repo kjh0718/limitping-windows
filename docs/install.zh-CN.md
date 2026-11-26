@@ -93,7 +93,8 @@ Windows 是 `.zip`（`limitping_windows_amd64.zip`、`limitping_windows_arm64.zi
 ConPTY 伪控制台驱动交互式 CLI，Codex 的 ping 以 headless 的 `codex exec` 运行。
 两者都支持以 `.cmd`/`.bat` shim 安装的 CLI（npm 安装的常见形态）；包含 `%`、NUL
 或换行的额外参数或 prompt 无法经 shim 传递，会被拒绝。超时或被取消的 `codex` 调用（包括重置额度兑换所用的 `codex app-server`）
-会连同 shim 启动的子进程一起结束，实时状态行也会按控制台宽度截断。Claude 在 macOS 上从钥匙串读凭据，
+会尽力连同 shim 启动的子进程一起结束：若无法持有进程句柄或 `taskkill` 失败，
+只会结束直接子进程，shim 的后代进程可能继续运行。实时状态行也会按控制台宽度截断。Claude 在 macOS 上从钥匙串读凭据，
 其他平台用 `~/.claude/.credentials.json`。通知仅 macOS 可用。
 
 </details>
