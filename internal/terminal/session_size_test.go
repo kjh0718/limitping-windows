@@ -2,8 +2,8 @@ package terminal
 
 import (
 	"context"
-	"os"
 	"os/exec"
+	"strings"
 	"testing"
 )
 
@@ -15,11 +15,15 @@ func TestStartWithSizeRejectsInvalidSizes(t *testing.T) {
 		{MaxTerminalDim + 1, 24}, {80, MaxTerminalDim + 1},
 	}
 	for _, c := range cases {
-		sess, err := StartWithSize(context.Background(), exec.Command(os.Args[0]), c.cols, c.rows)
+		// A binary that cannot exist: should validation ever be skipped the error
+		// is a LookPath one, and no child is ever started.
+		sess, err := StartWithSize(context.Background(), exec.Command("limitping-no-such-binary-xyz"), c.cols, c.rows)
 		if err == nil {
 			_ = sess.Kill()
 			_ = sess.Close()
 			t.Errorf("StartWithSize(%d, %d) accepted an invalid size", c.cols, c.rows)
+		} else if !strings.Contains(err.Error(), "invalid size") {
+			t.Errorf("StartWithSize(%d, %d) = %v, want the size validation error", c.cols, c.rows, err)
 		}
 	}
 }
