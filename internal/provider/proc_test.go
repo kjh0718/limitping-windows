@@ -12,5 +12,10 @@ func TestProcessHelpersIgnoreNil(t *testing.T) {
 }
 
 func TestHoldProcessNilIsNoop(t *testing.T) {
-	holdProcess(nil)()
+	var h procHold
+	h.acquire(nil)
+	h.release()
+	if err := h.kill(nil); err != nil {
+		t.Fatalf("kill(nil) = %v", err)
+	}
 }

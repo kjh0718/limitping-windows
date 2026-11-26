@@ -817,14 +817,15 @@ func triggerCodex(ctx context.Context, cfg config.ProviderConfig, dryRun bool) (
 	}
 	// On Windows the shim runs under cmd.exe: Cancel kills the whole tree, and
 	// WaitDelay bounds Run if a grandchild still holds the output pipes.
-	cmd.Cancel = func() error { return killProcessTree(cmd.Process) }
+	var hold procHold
+	cmd.Cancel = func() error { return hold.kill(cmd.Process) }
 	cmd.WaitDelay = 5 * time.Second
-	// Run is Start + Wait, split so the pid can be held in between (holdProcess).
+	// Run is Start + Wait, split so the pid can be held in between (procHold).
 	runErr := cmd.Start()
 	if runErr == nil {
-		release := holdProcess(cmd.Process)
+		hold.acquire(cmd.Process)
 		runErr = cmd.Wait()
-		release()
+		hold.release()
 	}
 	if runErr != nil {
 		return res, fmt.Errorf("codex exec failed: %w: %s", runErr, codexExecTail(stderr, stdout))

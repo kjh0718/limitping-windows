@@ -23,6 +23,14 @@ func killProcessTree(p *os.Process) error {
 	return p.Kill()
 }
 
-// holdProcess is a no-op on Unix: os.Process.Signal/Kill already refuse to act
-// on a process that Wait has reaped, so a pid cannot be reused under them.
-func holdProcess(*os.Process) (release func()) { return func() {} }
+// procHold keeps a started child's pid from being reused while a Cancel may
+// still run. Unix needs nothing: os.Process.Signal/Kill refuse to act on a
+// process that Wait has reaped.
+type procHold struct{}
+
+func (*procHold) acquire(*os.Process) {}
+func (*procHold) release()            {}
+
+// terminate and kill are what a Cancel calls: SIGTERM and the default Kill.
+func (*procHold) terminate(p *os.Process) error { return terminateProcess(p) }
+func (*procHold) kill(p *os.Process) error      { return killProcessTree(p) }

@@ -61,7 +61,8 @@ var codexBinary = "codex"
 // server pushes meanwhile are skipped.
 func runCodexAppServer(ctx context.Context, method string, params any) (json.RawMessage, error) {
 	cmd := exec.CommandContext(ctx, codexBinary, "app-server")
-	cmd.Cancel = func() error { return terminateProcess(cmd.Process) }
+	var hold procHold
+	cmd.Cancel = func() error { return hold.terminate(cmd.Process) }
 	cmd.WaitDelay = 2 * time.Second
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -74,12 +75,12 @@ func runCodexAppServer(ctx context.Context, method string, params any) (json.Raw
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("%w: %v", errCodexAppServerUnavailable, err)
 	}
-	release := holdProcess(cmd.Process)
+	hold.acquire(cmd.Process)
 	defer func() {
 		_ = stdin.Close()
-		_ = terminateProcess(cmd.Process)
+		_ = hold.terminate(cmd.Process)
 		_ = cmd.Wait()
-		release() // only after Wait: a Cancel may run until then
+		hold.release() // only after Wait: a Cancel may run until then
 	}()
 
 	return codexRPCExchange(stdin, stdout, method, params)
