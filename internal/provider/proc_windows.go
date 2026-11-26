@@ -7,7 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
-	"sync/atomic"
+	"sync"
 	"syscall"
 
 	"golang.org/x/sys/windows"
@@ -60,24 +60,36 @@ var openProcess = windows.OpenProcess
 // If the handle cannot be opened nothing reserves the PID, so terminate and kill
 // fall back to Process.Kill, which acts through Go's own handle and cannot hit a
 // stranger (it ends the direct child only).
+//
+// The mutex orders a Cancel that fires between Start and acquire: kill holds it
+// for the whole kill, and acquire needs it, so the caller's following Wait (which
+// is what closes Go's handle) cannot start until that kill has finished. Either
+// acquire ran first and kill sees its outcome, or kill ran first with Go's handle
+// still open. release runs after Wait, and Cmd.Wait does not return before a
+// running Cancel has, so release never waits on a live kill.
 type procHold struct {
+	mu     sync.Mutex
 	h      windows.Handle
-	failed atomic.Bool // set by acquire, read by a concurrent Cancel
+	failed bool
 }
 
 func (h *procHold) acquire(p *os.Process) {
 	if p == nil {
 		return
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	hd, err := openProcess(windows.SYNCHRONIZE, false, uint32(p.Pid))
 	if err != nil {
-		h.failed.Store(true)
+		h.failed = true
 		return
 	}
 	h.h = hd
 }
 
 func (h *procHold) release() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	if h.h != 0 {
 		_ = windows.CloseHandle(h.h)
 		h.h = 0
@@ -87,7 +99,9 @@ func (h *procHold) release() {
 func (h *procHold) terminate(p *os.Process) error { return h.kill(p) }
 
 func (h *procHold) kill(p *os.Process) error {
-	if h.failed.Load() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.failed {
 		if p == nil {
 			return nil
 		}
