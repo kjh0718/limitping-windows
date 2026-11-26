@@ -5,6 +5,10 @@ package terminal
 import (
 	"bytes"
 	"context"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -19,7 +23,7 @@ func TestStartRunsCommandAndReadsOutput(t *testing.T) {
 	defer cancel()
 
 	const marker = "pty-test-output"
-	sess, err := Start(ctx, "sh", []string{"-c", "echo " + marker})
+	sess, err := Start(ctx, exec.Command("sh", "-c", "echo "+marker))
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -102,7 +106,7 @@ func TestKillTerminatesCommand(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	sess, err := Start(ctx, "sh", []string{"-c", "sleep 60"})
+	sess, err := Start(ctx, exec.Command("sh", "-c", "sleep 60"))
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -147,7 +151,7 @@ func TestKillAfterWaitSucceeds(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	sess, err := Start(ctx, "sh", []string{"-c", "exit 0"})
+	sess, err := Start(ctx, exec.Command("sh", "-c", "exit 0"))
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -182,5 +186,63 @@ func TestKillAfterWaitSucceeds(t *testing.T) {
 
 	if err := sess.Kill(); err != nil {
 		t.Fatalf("Kill after Wait = %v, want nil for an already-exited child", err)
+	}
+}
+
+// TestStartAppliesDirAndEnv confirms Dir and Env reach the child under the PTY,
+// and that ctx governs a child built with plain exec.Command.
+func TestStartAppliesDirAndEnv(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	dir := t.TempDir()
+	cmd := exec.Command("sh", "-c", "echo [$LIMITPING_ADDED]; pwd -P")
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "LIMITPING_ADDED=added-value")
+	sess, err := Start(ctx, cmd)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer sess.Close()
+
+	var buf bytes.Buffer
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		_, _ = io.Copy(&buf, sess) // ends with EIO/EOF once the child is gone
+	}()
+	if err := sess.Wait(); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	_ = sess.Close()
+	<-readDone
+
+	real, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := buf.String()
+	if !strings.Contains(got, "[added-value]") || !strings.Contains(got, real) {
+		t.Fatalf("child did not see Env/Dir; got %q, want [added-value] and %q", got, real)
+	}
+}
+
+func TestStartContextCancelKillsExecCommandChild(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sess, err := Start(ctx, exec.Command("sh", "-c", "sleep 60"))
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer sess.Close()
+	go func() { _, _ = io.Copy(io.Discard, sess) }()
+
+	waitErr := make(chan error, 1)
+	go func() { waitErr <- sess.Wait() }()
+	cancel()
+	select {
+	case <-waitErr:
+	case <-time.After(10 * time.Second):
+		t.Fatal("cancelling ctx did not terminate an exec.Command child")
 	}
 }

@@ -8,7 +8,9 @@ package terminal
 
 import (
 	"context"
+	"errors"
 	"io"
+	"os/exec"
 )
 
 // Session is a child process running under a pseudo-terminal. Read and Write
@@ -30,10 +32,37 @@ type Session interface {
 	Kill() error
 }
 
-// Start launches name (with args) attached to a new pseudo-terminal and returns
-// a Session that owns the child's lifecycle. Cancelling ctx terminates the
-// child. It returns an error and a nil Session if the terminal or the child
-// cannot be created.
-func Start(ctx context.Context, name string, args []string) (Session, error) {
-	return start(ctx, name, args)
+// Start launches cmd attached to a new pseudo-terminal and returns a Session
+// that owns the child's lifecycle. Cancelling ctx terminates the child, whether
+// cmd came from exec.Command or exec.CommandContext. On Unix pty.Start runs
+// cmd.Start, so a CommandContext's own Cancel applies as well; on Windows the
+// process is created by hand, cmd.Cancel and cmd.WaitDelay are never consulted,
+// and ctx alone kills the whole job. cmd must not have been started.
+//
+// Only Path, Args, Dir and Env of cmd are honoured (a nil Env inherits this
+// process's environment, as for os/exec). The PTY is the child's stdio and
+// session, so Stdin, Stdout, Stderr, ExtraFiles and SysProcAttr must be unset;
+// Start rejects them on every OS rather than let one backend silently ignore a
+// field the other honours. A LookPath failure recorded in cmd.Err is returned.
+// It returns an error and a nil Session if the terminal or the child cannot be
+// created.
+func Start(ctx context.Context, cmd *exec.Cmd) (Session, error) {
+	if cmd.Err != nil {
+		return nil, cmd.Err
+	}
+	if cmd.Process != nil {
+		return nil, errors.New("terminal: cmd has already been started")
+	}
+	if cmd.Stdin != nil || cmd.Stdout != nil || cmd.Stderr != nil ||
+		len(cmd.ExtraFiles) != 0 || cmd.SysProcAttr != nil {
+		return nil, errors.New("terminal: Stdin, Stdout, Stderr, ExtraFiles and SysProcAttr are not supported; the pseudo-terminal is the child's stdio")
+	}
+	return start(ctx, cmd)
 }
+
+// PrepareCommand adapts cmd for plain os/exec use (Run/Start, not Start above) so
+// it launches correctly on the platform. On Windows a .cmd/.bat target (how
+// npm-installed CLIs ship) is rewritten to run through COMSPEC with cmd.exe-safe
+// quoting, and arguments that cmd.exe cannot carry intact (NUL, newline, %) are
+// rejected with an error. On Unix it does nothing.
+func PrepareCommand(cmd *exec.Cmd) error { return prepareCommand(cmd) }

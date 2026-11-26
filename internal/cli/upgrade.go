@@ -16,13 +16,16 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+
+	"github.com/wavever/CCLimitPing/internal/update"
 )
 
 const releaseDownloadBase = "https://github.com/wavever/CCLimitPing/releases/latest/download"
 
 func newUpgradeCmd() *cobra.Command {
+	var force bool
 	text := localizedText()
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:     "upgrade",
 		Aliases: []string{"up", "update"},
 		Short:   text.upgradeShort,
@@ -31,9 +34,30 @@ func newUpgradeCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx, cancel := context.WithTimeout(cmd.Context(), 5*time.Minute)
 			defer cancel()
-			return runUpgrade(ctx, cmd.OutOrStdout(), cmd.ErrOrStderr())
+			out := cmd.OutOrStdout()
+			// Say so instead of re-downloading and reinstalling the same build.
+			// A failed or empty lookup falls through and upgrades anyway, which
+			// is the behaviour this command has always had. The lookup is fresh,
+			// never the notice's cache: a version cached before the release
+			// shipped would turn the upgrade down as already current.
+			if latest := update.Refresh(ctx, updateHTTPClient); latest != "" && !force && isReleaseVersion() {
+				if update.Available(version(), latest, "") == "" {
+					fmt.Fprintf(out, text.upgradeCurrentFmt, update.Normalize(version()))
+					// Still repair the alias. A binary installed before the
+					// alias existed, or upgraded by a version that did not
+					// create it, is already current and would otherwise never
+					// get one — there is no upgrade left to hang it off.
+					if exe, err := currentExecutable(); err == nil {
+						ensureAlias(exe, out)
+					}
+					return nil
+				}
+			}
+			return runUpgrade(ctx, out, cmd.ErrOrStderr())
 		},
 	}
+	cmd.Flags().BoolVar(&force, "force", false, text.upgradeForceFlag)
+	return cmd
 }
 
 func runUpgrade(ctx context.Context, out, errOut io.Writer) error {
@@ -41,13 +65,9 @@ func runUpgrade(ctx context.Context, out, errOut io.Writer) error {
 		return fmt.Errorf("self-upgrade is not supported on Windows; download the latest zip from GitHub releases")
 	}
 
-	exe, err := os.Executable()
+	exe, err := currentExecutable()
 	if err != nil {
-		return fmt.Errorf("locating current executable: %w", err)
-	}
-	exe, err = filepath.EvalSymlinks(exe)
-	if err != nil {
-		return fmt.Errorf("resolving current executable: %w", err)
+		return err
 	}
 
 	asset, err := releaseAssetName()
@@ -79,11 +99,33 @@ func runUpgrade(ctx context.Context, out, errOut io.Writer) error {
 		return err
 	}
 	fmt.Fprintf(out, "Upgraded limitping -> %s\n", exe)
+	ensureAlias(exe, out)
+	// The new binary, not this one, knows which hook events it relies on, so
+	// it re-registers the hooks of whichever providers already have them.
+	// Best-effort: the upgrade itself has already succeeded.
+	refresh := exec.Command(exe, "hooks", "install", "--refresh")
+	refresh.Stdout = out
+	refresh.Stderr = errOut
+	_ = refresh.Run()
 	cmd := exec.Command(exe, "version")
 	cmd.Stdout = out
 	cmd.Stderr = errOut
 	_ = cmd.Run()
 	return nil
+}
+
+// currentExecutable is the running binary with symlinks resolved, so an upgrade
+// invoked through the alias replaces the binary rather than the link.
+func currentExecutable() (string, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("locating current executable: %w", err)
+	}
+	exe, err = filepath.EvalSymlinks(exe)
+	if err != nil {
+		return "", fmt.Errorf("resolving current executable: %w", err)
+	}
+	return exe, nil
 }
 
 func releaseAssetName() (string, error) {
