@@ -5,6 +5,7 @@ package terminal
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"os/exec"
@@ -244,5 +245,21 @@ func TestStartContextCancelKillsExecCommandChild(t *testing.T) {
 	case <-waitErr:
 	case <-time.After(10 * time.Second):
 		t.Fatal("cancelling ctx did not terminate an exec.Command child")
+	}
+}
+
+// A ctx that is already done must not run the child at all, and must not leave
+// a session behind.
+func TestStartCancelledContextNeverRunsChild(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "ran")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	sess, err := Start(ctx, exec.Command("sh", "-c", `touch "$1"`, "sh", marker))
+	if sess != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("Start = (%v, %v), want (nil, context.Canceled)", sess, err)
+	}
+	time.Sleep(500 * time.Millisecond)
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("the child ran although ctx was already cancelled")
 	}
 }

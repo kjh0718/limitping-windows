@@ -54,7 +54,7 @@ func start(ctx context.Context, cmd *exec.Cmd) (Session, error) {
 		pty.teardown()
 		return nil, err
 	}
-	proc, err := startAttached(cmd, envBlock, pty.hpc, job)
+	proc, err := startAttached(ctx, cmd, envBlock, pty.hpc, job)
 	if err != nil {
 		// Closing the job kills anything that did get assigned to it.
 		_ = job.close()
@@ -96,7 +96,7 @@ func start(ctx context.Context, cmd *exec.Cmd) (Session, error) {
 // maintainers recommend for a ConPTY parent whose own output is redirected. It
 // is also why handle inheritance stays off: nothing is being handed down, and
 // the pseudoconsole duplicates the pipe ends it needs by itself.
-func startAttached(cmd *exec.Cmd, envBlock *uint16, hpc windows.Handle, job *jobObject) (windows.Handle, error) {
+func startAttached(ctx context.Context, cmd *exec.Cmd, envBlock *uint16, hpc windows.Handle, job *jobObject) (windows.Handle, error) {
 	attrs, err := windows.NewProcThreadAttributeList(1)
 	if err != nil {
 		return 0, fmt.Errorf("NewProcThreadAttributeList: %w", err)
@@ -171,6 +171,14 @@ func startAttached(cmd *exec.Cmd, envBlock *uint16, hpc windows.Handle, job *job
 		_ = windows.CloseHandle(pi.Process)
 		return 0, err
 	}
+	// ctx may have ended while the child was being set up. It is still suspended
+	// and has run nothing, so tear it down instead of letting it start.
+	if err := ctx.Err(); err != nil {
+		_ = windows.TerminateProcess(pi.Process, 1)
+		_ = windows.CloseHandle(pi.Thread)
+		_ = windows.CloseHandle(pi.Process)
+		return 0, err
+	}
 	if _, err := windows.ResumeThread(pi.Thread); err != nil {
 		_ = windows.TerminateProcess(pi.Process, 1)
 		_ = windows.CloseHandle(pi.Thread)
@@ -201,11 +209,12 @@ func prepareWindowsCommand(cmd *exec.Cmd) (appName, cmdLine string, err error) {
 	if len(cmd.Args) == 0 {
 		return "", "", errors.New("terminal: cmd.Args is empty")
 	}
-	switch strings.ToLower(filepath.Ext(cmd.Path)) {
+	path := cmd.Path
+	switch strings.ToLower(filepath.Ext(path)) {
 	case ".cmd", ".bat":
-		return batchCommand(cmd.Path, cmd.Args[1:])
+		return batchCommand(path, cmd.Args[1:])
 	default:
-		return cmd.Path, windows.ComposeCommandLine(cmd.Args), nil
+		return path, windows.ComposeCommandLine(cmd.Args), nil
 	}
 }
 
@@ -393,7 +402,8 @@ func prepareCommand(cmd *exec.Cmd) error {
 	if cmd.Err != nil {
 		return nil // os/exec reports it from Run
 	}
-	switch strings.ToLower(filepath.Ext(cmd.Path)) {
+	path := cmd.Path
+	switch strings.ToLower(filepath.Ext(path)) {
 	case ".cmd", ".bat":
 	default:
 		return nil
@@ -401,7 +411,7 @@ func prepareCommand(cmd *exec.Cmd) error {
 	if len(cmd.Args) == 0 {
 		return errors.New("terminal: cmd.Args is empty")
 	}
-	comspec, line, err := batchCommand(cmd.Path, cmd.Args[1:])
+	comspec, line, err := batchCommand(path, cmd.Args[1:])
 	if err != nil {
 		return err
 	}

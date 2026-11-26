@@ -1072,3 +1072,48 @@ func TestEmptyArgsIsAnErrorNotAPanic(t *testing.T) {
 		t.Fatal("PrepareCommand accepted a batch cmd with no Args")
 	}
 }
+
+// A ctx that is already done must not run the child at all (the contract
+// exec.CommandContext has), and must not leave a session behind.
+func TestStartCancelledContextNeverRunsChild(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "ran")
+	shim := writeShim(t, "shim", "limitping-marker.cmd", "@echo off\r\necho x> \""+marker+"\"\r\n")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	sess, err := Start(ctx, exec.Command(shim))
+	if sess != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("Start = (%v, %v), want (nil, context.Canceled)", sess, err)
+	}
+	time.Sleep(time.Second)
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("the child ran although ctx was already cancelled")
+	}
+}
+
+// ctx ending after the child is created but before it is resumed (the window the
+// up-front check cannot cover) must tear the suspended child down unrun.
+func TestStartAttachedCancelledBeforeResumeNeverRunsChild(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "ran")
+	shim := writeShim(t, "shim", "limitping-marker.cmd", "@echo off\r\necho x> \""+marker+"\"\r\n")
+	pty, err := newConPTY(conPTYSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pty.teardown()
+	job, err := newJobObject()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer job.close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if proc, err := startAttached(ctx, exec.Command(shim), nil, pty.hpc, job); !errors.Is(err, context.Canceled) {
+		_ = windows.CloseHandle(proc)
+		t.Fatalf("startAttached = %v, want context.Canceled", err)
+	}
+	time.Sleep(time.Second)
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("the suspended child was resumed although ctx was cancelled")
+	}
+}

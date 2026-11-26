@@ -44,8 +44,8 @@ type Session interface {
 // session, so Stdin, Stdout, Stderr, ExtraFiles and SysProcAttr must be unset;
 // Start rejects them on every OS rather than let one backend silently ignore a
 // field the other honours. A LookPath failure recorded in cmd.Err is returned.
-// It returns an error and a nil Session if the terminal or the child cannot be
-// created.
+// It returns an error and a nil Session if ctx is already done (the child is
+// never started) or if the terminal or the child cannot be created.
 func Start(ctx context.Context, cmd *exec.Cmd) (Session, error) {
 	if cmd.Err != nil {
 		return nil, cmd.Err
@@ -56,6 +56,11 @@ func Start(ctx context.Context, cmd *exec.Cmd) (Session, error) {
 	if cmd.Stdin != nil || cmd.Stdout != nil || cmd.Stderr != nil ||
 		len(cmd.ExtraFiles) != 0 || cmd.SysProcAttr != nil {
 		return nil, errors.New("terminal: Stdin, Stdout, Stderr, ExtraFiles and SysProcAttr are not supported; the pseudo-terminal is the child's stdio")
+	}
+	// A ctx that is already done must not run the child at all, as with
+	// exec.CommandContext; checked before any terminal resource is allocated.
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return start(ctx, cmd)
 }
