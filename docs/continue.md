@@ -29,7 +29,9 @@ limitping continue claude --dangerously-skip-permissions
   automatically at usage limit" in `/config`, on by default). `continue claude`
   defers to it: at recovery it waits up to 90 seconds for Claude Code to announce
   the resume or start the turn, and only types the message when it didn't — so
-  the task is never continued twice, and older Claude Code still gets resumed.
+  the task isn't continued twice, and older Claude Code still gets resumed. (On
+  Windows with an npm `.cmd` shim this check is best-effort; see the notes
+  below.)
 - A diagnostic timeline is written to `~/.config/limitping/continue.log`
   (rotated to `continue.log.1` past 1 MB).
 - Works on Unix (PTY) and Windows 10 1809+ (ConPTY). Windows notes:

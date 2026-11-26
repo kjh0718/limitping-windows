@@ -23,7 +23,7 @@ limitping continue claude --dangerously-skip-permissions
 - 新版 Claude Code 能在限额重置后自己续跑任务(`/config` 中的 "Continue automatically at
   usage limit",默认开启)。`continue claude` 会让它先来:恢复时最多等 90 秒,看 Claude Code
   是否宣布续跑或已开始这一轮,只有没有时才输入续跑消息 —— 任务不会被续两次,旧版
-  Claude Code 也照样能续上。
+  Claude Code 也照样能续上。(Windows 上通过 npm `.cmd` shim 运行时,这一检查只是尽力而为,见下方说明。)
 - 诊断时间线写入 `~/.config/limitping/continue.log`(超过 1 MB 轮转为 `continue.log.1`)。
 - 支持 Unix(PTY)和 Windows 10 1809+(ConPTY)。Windows 说明:
   - Ctrl+Z 不会转发给 CLI(控制台把它当作输入结束,`continue` 会忽略它,键盘输入照常可用)。

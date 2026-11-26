@@ -21,8 +21,7 @@ func TestSessionResizeSetsPtySize(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StartWithSize: %v", err)
 	}
-	defer sess.Close()
-	defer sess.Kill()
+	defer reap(sess)
 
 	ptmx := sess.(*unixSession).ptmx
 	if rows, cols, err := pty.Getsize(ptmx); err != nil || cols != 100 || rows != 40 {
@@ -49,8 +48,7 @@ func TestSessionPid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	defer sess.Close()
-	defer sess.Kill()
+	defer reap(sess)
 	if sess.Pid() <= 0 || sess.Pid() != cmd.Process.Pid {
 		t.Fatalf("Pid = %d, want cmd.Process.Pid %d", sess.Pid(), cmd.Process.Pid)
 	}
@@ -65,7 +63,7 @@ func TestSessionResizeAfterCloseIsErrClosed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	defer sess.Kill()
+	defer reap(sess)
 	if err := sess.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -108,7 +106,16 @@ func TestSessionConcurrentResizeAndClose(t *testing.T) {
 		if err := sess.Resize(80, 24); !errors.Is(err, os.ErrClosed) {
 			t.Fatalf("iteration %d: Resize after Close = %v, want os.ErrClosed", i, err)
 		}
-		_ = sess.Kill()
+		reap(sess)
 		cancel()
 	}
+}
+
+// reap kills the test child and waits for it, so no killed child is left
+// unreaped. After an explicit Close the second Close only returns an error,
+// which is ignored.
+func reap(sess Session) {
+	_ = sess.Kill()
+	_ = sess.Wait()
+	_ = sess.Close()
 }
