@@ -159,7 +159,7 @@ func (l *logRecorder) snapshot() []string {
 // A persistent failure is logged once; a different failure, or the same one after
 // a success, is logged again.
 func TestWatchResizeLogsFailureKindsOnce(t *testing.T) {
-	rec := &resizeRecorder{errs: []error{errors.New("A"), errors.New("A"), errors.New("A"), errors.New("B"), errors.New("B"), nil, errors.New("A")}}
+	rec := &resizeRecorder{errs: []error{errors.New("A"), errors.New("A"), errors.New("A"), errors.New("B"), errors.New("B"), nil, errors.New("B")}}
 	lr := &logRecorder{}
 	done := make(chan struct{})
 	finished := make(chan struct{})
@@ -184,8 +184,8 @@ func TestWatchResizeLogsFailureKindsOnce(t *testing.T) {
 	<-finished
 
 	lines := lr.snapshot()
-	if len(lines) != 3 || !strings.HasSuffix(lines[0], ": A") || !strings.HasSuffix(lines[1], ": B") || !strings.HasSuffix(lines[2], ": A") {
-		t.Fatalf("log lines = %q, want one each for A, B, and A again after a success", lines)
+	if len(lines) != 3 || !strings.HasSuffix(lines[0], ": A") || !strings.HasSuffix(lines[1], ": B") || !strings.HasSuffix(lines[2], ": B") {
+		t.Fatalf("log lines = %q, want one for A, one for B, and B again after a success", lines)
 	}
 }
 
