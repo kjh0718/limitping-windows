@@ -3,6 +3,7 @@
 package provider
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -41,7 +42,13 @@ func killProcessTree(p *os.Process) error {
 	if cmd.Run() == nil {
 		return nil
 	}
-	return p.Kill() // taskkill unavailable or the pid is gone; os.ErrProcessDone if finished
+	// taskkill unavailable, or it lost a race with the tree exiting by itself (it
+	// kills leaves first, so the shim's cmd.exe can end on its own before taskkill
+	// reaches it). A process that is already gone is the state asked for.
+	if err := p.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		return err
+	}
+	return nil
 }
 
 // openProcess is a seam for tests of the not-held fallback.
