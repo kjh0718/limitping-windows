@@ -24,8 +24,16 @@ type unixSession struct {
 	waitedOnce sync.Once
 }
 
-func start(ctx context.Context, cmd *exec.Cmd) (Session, error) {
-	ptmx, err := pty.Start(cmd)
+func start(ctx context.Context, cmd *exec.Cmd, cols, rows int) (Session, error) {
+	var (
+		ptmx *os.File
+		err  error
+	)
+	if cols > 0 {
+		ptmx, err = pty.StartWithSize(cmd, &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)})
+	} else {
+		ptmx, err = pty.Start(cmd)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -48,6 +56,14 @@ func prepareCommand(*exec.Cmd) error { return nil }
 func (s *unixSession) Read(p []byte) (int, error)  { return s.ptmx.Read(p) }
 func (s *unixSession) Write(p []byte) (int, error) { return s.ptmx.Write(p) }
 func (s *unixSession) Close() error                { return s.ptmx.Close() }
+func (s *unixSession) Pid() int                    { return s.cmd.Process.Pid }
+
+func (s *unixSession) Resize(cols, rows int) error {
+	if err := validateSize(cols, rows); err != nil {
+		return err
+	}
+	return pty.Setsize(s.ptmx, &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)})
+}
 func (s *unixSession) Wait() error {
 	err := s.cmd.Wait()
 	s.waitedOnce.Do(func() { close(s.waited) })

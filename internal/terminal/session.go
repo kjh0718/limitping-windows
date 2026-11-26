@@ -9,9 +9,16 @@ package terminal
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"math"
 	"os/exec"
 )
+
+// MaxTerminalDim is the largest column or row count Start/Resize accept. It is
+// the limit of a ConPTY COORD (int16), applied on every OS so both backends
+// reject the same sizes.
+const MaxTerminalDim = math.MaxInt16
 
 // Session is a child process running under a pseudo-terminal. Read and Write
 // are the PTY master side — Read drains the child's output, Write feeds its
@@ -30,6 +37,14 @@ type Session interface {
 	// Kill force-terminates the child. It is safe to call when the process is
 	// already gone.
 	Kill() error
+	// Resize sets the pseudo-terminal's size in character cells. Both
+	// dimensions must be in 1..MaxTerminalDim. After the session has been closed
+	// (or, on Windows, once the child has exited) it returns os.ErrClosed.
+	Resize(cols, rows int) error
+	// Pid is the operating-system process id of the child that Start created
+	// (for a .cmd/.bat target on Windows that is the cmd.exe interpreter, not
+	// the script's own descendants).
+	Pid() int
 }
 
 // Start launches cmd attached to a new pseudo-terminal and returns a Session
@@ -47,6 +62,19 @@ type Session interface {
 // It returns an error and a nil Session if ctx is already done (the child is
 // never started) or if the terminal or the child cannot be created.
 func Start(ctx context.Context, cmd *exec.Cmd) (Session, error) {
+	return StartWithSize(ctx, cmd, 0, 0)
+}
+
+// StartWithSize is Start with an initial terminal size, so a TUI lays itself out
+// at the real size from its first frame instead of racing a later Resize. cols
+// and rows of 0 and 0 keep the platform default (the OS pty default on Unix,
+// 120x30 on Windows); otherwise both must be in 1..MaxTerminalDim.
+func StartWithSize(ctx context.Context, cmd *exec.Cmd, cols, rows int) (Session, error) {
+	if cols != 0 || rows != 0 {
+		if err := validateSize(cols, rows); err != nil {
+			return nil, err
+		}
+	}
 	if cmd.Err != nil {
 		return nil, cmd.Err
 	}
@@ -62,7 +90,15 @@ func Start(ctx context.Context, cmd *exec.Cmd) (Session, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return start(ctx, cmd)
+	return start(ctx, cmd, cols, rows)
+}
+
+// validateSize rejects anything but a positive, in-range cols x rows.
+func validateSize(cols, rows int) error {
+	if cols < 1 || rows < 1 || cols > MaxTerminalDim || rows > MaxTerminalDim {
+		return fmt.Errorf("terminal: invalid size %dx%d (each dimension must be 1..%d)", cols, rows, MaxTerminalDim)
+	}
+	return nil
 }
 
 // PrepareCommand adapts cmd for plain os/exec use (Run/Start, not Start above) so

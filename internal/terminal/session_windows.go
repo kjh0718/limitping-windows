@@ -24,6 +24,7 @@ import (
 type windowsSession struct {
 	pty *conPTY
 	job *jobObject
+	pid int
 
 	// processDone is closed once the child has exited and waitErr holds its
 	// result. The real wait runs exactly once, in a background waiter started by
@@ -34,7 +35,7 @@ type windowsSession struct {
 	closeOnce sync.Once
 }
 
-func start(ctx context.Context, cmd *exec.Cmd) (Session, error) {
+func start(ctx context.Context, cmd *exec.Cmd, cols, rows int) (Session, error) {
 	// cmd is used only for what os/exec resolved (Path, Args, Dir, Env); the
 	// process itself has to be created by hand, because attaching a pseudoconsole
 	// needs an extended startup info block that (*exec.Cmd).Start does not expose.
@@ -45,7 +46,11 @@ func start(ctx context.Context, cmd *exec.Cmd) (Session, error) {
 		return nil, err
 	}
 
-	pty, err := newConPTY(conPTYSize)
+	size := conPTYSize
+	if cols > 0 {
+		size = windows.Coord{X: int16(cols), Y: int16(rows)}
+	}
+	pty, err := newConPTY(size)
 	if err != nil {
 		return nil, err
 	}
@@ -54,7 +59,7 @@ func start(ctx context.Context, cmd *exec.Cmd) (Session, error) {
 		pty.teardown()
 		return nil, err
 	}
-	proc, err := startAttached(ctx, cmd, envBlock, pty.hpc, job)
+	proc, pid, err := startAttached(ctx, cmd, envBlock, pty.hpc, job)
 	if err != nil {
 		// Closing the job kills anything that did get assigned to it.
 		_ = job.close()
@@ -62,14 +67,14 @@ func start(ctx context.Context, cmd *exec.Cmd) (Session, error) {
 		return nil, err
 	}
 
-	s := &windowsSession{pty: pty, job: job, processDone: make(chan struct{})}
+	s := &windowsSession{pty: pty, job: job, pid: int(pid), processDone: make(chan struct{})}
 	go s.wait(proc)
 	go s.watch(ctx)
 	return s, nil
 }
 
 // startAttached creates the child attached to the pseudoconsole and returns its
-// process handle, which the caller's waiter owns from then on.
+// process handle, which the caller's waiter owns from then on, and its pid.
 //
 // The startup info is an extended block whose Cb covers the whole STARTUPINFOEX
 // (not just the STARTUPINFO inside it), carrying the pseudoconsole attribute,
@@ -96,10 +101,10 @@ func start(ctx context.Context, cmd *exec.Cmd) (Session, error) {
 // maintainers recommend for a ConPTY parent whose own output is redirected. It
 // is also why handle inheritance stays off: nothing is being handed down, and
 // the pseudoconsole duplicates the pipe ends it needs by itself.
-func startAttached(ctx context.Context, cmd *exec.Cmd, envBlock *uint16, hpc windows.Handle, job *jobObject) (windows.Handle, error) {
+func startAttached(ctx context.Context, cmd *exec.Cmd, envBlock *uint16, hpc windows.Handle, job *jobObject) (windows.Handle, uint32, error) {
 	attrs, err := windows.NewProcThreadAttributeList(1)
 	if err != nil {
-		return 0, fmt.Errorf("NewProcThreadAttributeList: %w", err)
+		return 0, 0, fmt.Errorf("NewProcThreadAttributeList: %w", err)
 	}
 	defer attrs.Delete()
 
@@ -114,7 +119,7 @@ func startAttached(ctx context.Context, cmd *exec.Cmd, envBlock *uint16, hpc win
 		*(*unsafe.Pointer)(unsafe.Pointer(&hpc)),
 		unsafe.Sizeof(hpc),
 	); err != nil {
-		return 0, fmt.Errorf("UpdateProcThreadAttribute: %w", err)
+		return 0, 0, fmt.Errorf("UpdateProcThreadAttribute: %w", err)
 	}
 
 	var si windows.StartupInfoEx
@@ -125,21 +130,21 @@ func startAttached(ctx context.Context, cmd *exec.Cmd, envBlock *uint16, hpc win
 
 	app, line, err := prepareWindowsCommand(cmd)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	appName, err := windows.UTF16PtrFromString(app)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	cmdLine, err := windows.UTF16PtrFromString(line)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 
 	var dir *uint16
 	if cmd.Dir != "" {
 		if dir, err = windows.UTF16PtrFromString(cmd.Dir); err != nil {
-			return 0, err
+			return 0, 0, err
 		}
 	}
 
@@ -160,7 +165,7 @@ func startAttached(ctx context.Context, cmd *exec.Cmd, envBlock *uint16, hpc win
 		&si.StartupInfo,
 		&pi,
 	); err != nil {
-		return 0, fmt.Errorf("CreateProcess: %w", err)
+		return 0, 0, fmt.Errorf("CreateProcess: %w", err)
 	}
 
 	// Created suspended so the job assignment lands before the child runs its
@@ -169,7 +174,7 @@ func startAttached(ctx context.Context, cmd *exec.Cmd, envBlock *uint16, hpc win
 		_ = windows.TerminateProcess(pi.Process, 1)
 		_ = windows.CloseHandle(pi.Thread)
 		_ = windows.CloseHandle(pi.Process)
-		return 0, err
+		return 0, 0, err
 	}
 	// ctx may have ended while the child was being set up. It is still suspended
 	// and has run nothing, so tear it down instead of letting it start.
@@ -177,16 +182,16 @@ func startAttached(ctx context.Context, cmd *exec.Cmd, envBlock *uint16, hpc win
 		_ = windows.TerminateProcess(pi.Process, 1)
 		_ = windows.CloseHandle(pi.Thread)
 		_ = windows.CloseHandle(pi.Process)
-		return 0, err
+		return 0, 0, err
 	}
 	if _, err := windows.ResumeThread(pi.Thread); err != nil {
 		_ = windows.TerminateProcess(pi.Process, 1)
 		_ = windows.CloseHandle(pi.Thread)
 		_ = windows.CloseHandle(pi.Process)
-		return 0, fmt.Errorf("ResumeThread: %w", err)
+		return 0, 0, fmt.Errorf("ResumeThread: %w", err)
 	}
 	_ = windows.CloseHandle(pi.Thread)
-	return pi.Process, nil
+	return pi.Process, pi.ProcessId, nil
 }
 
 // prepareWindowsCommand decides how CreateProcess should launch cmd: what to
@@ -515,6 +520,15 @@ func (s *windowsSession) Wait() error {
 }
 
 func (s *windowsSession) Kill() error { return s.job.terminate() }
+
+func (s *windowsSession) Pid() int { return s.pid }
+
+func (s *windowsSession) Resize(cols, rows int) error {
+	if err := validateSize(cols, rows); err != nil {
+		return err
+	}
+	return s.pty.resize(windows.Coord{X: int16(cols), Y: int16(rows)})
+}
 
 // Close tears the session down, once, in the order conPTY.shutdown documents:
 // the pipe ends go first, the pseudoconsole close runs in the background, and

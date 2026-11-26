@@ -15,10 +15,10 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// conPTYSize is the size every pseudoconsole is created with. The interactive
-// CLIs only need a plausible terminal to lay their TUI out in, and nothing here
-// resizes, so this is fixed rather than tracked against a real console: the ping
-// paths run detached, where there is no console to track.
+// conPTYSize is the default size of a pseudoconsole (Start, or StartWithSize
+// with 0x0). The ping paths run detached, where there is no console to track, and
+// the interactive CLIs only need a plausible terminal to lay their TUI out in;
+// the continue proxy passes the real console size instead and resizes it later.
 var conPTYSize = windows.Coord{X: 120, Y: 30}
 
 const (
@@ -183,6 +183,24 @@ type conPTY struct {
 
 	hpcOnce sync.Once
 	hpcDone chan struct{}
+
+	// hpcMu guards hpcClosed and is held across the whole ResizePseudoConsole
+	// call: ClosePseudoConsole frees the HPCON, so a resize running against it
+	// would be a use-after-free. closeHPCON takes it to set hpcClosed before the
+	// close starts; the close itself runs outside the lock.
+	hpcMu     sync.Mutex
+	hpcClosed bool
+}
+
+// resize changes the pseudoconsole's size, or returns os.ErrClosed once the
+// close has been started.
+func (c *conPTY) resize(size windows.Coord) error {
+	c.hpcMu.Lock()
+	defer c.hpcMu.Unlock()
+	if c.hpcClosed {
+		return os.ErrClosed
+	}
+	return windows.ResizePseudoConsole(c.hpc, size)
 }
 
 // newConPTY creates a pseudoconsole of the given size and returns the parent
@@ -251,6 +269,9 @@ func newConPTY(size windows.Coord) (*conPTY, error) {
 // has drained.
 func (c *conPTY) closeHPCON() <-chan struct{} {
 	c.hpcOnce.Do(func() {
+		c.hpcMu.Lock()
+		c.hpcClosed = true
+		c.hpcMu.Unlock()
 		go func() {
 			defer close(c.hpcDone)
 			windows.ClosePseudoConsole(c.hpc)
