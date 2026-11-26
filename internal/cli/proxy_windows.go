@@ -302,7 +302,7 @@ func watchResize(done <-chan struct{}, interval time.Duration, cols, rows int, s
 			if errors.Is(err, os.ErrClosed) {
 				return
 			}
-			report(fmt.Sprintf("resizing to %dx%d", c, r), err)
+			report("resizing the session", err)
 			continue
 		}
 		lastErr = ""
