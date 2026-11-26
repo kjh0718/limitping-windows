@@ -25,4 +25,11 @@ limitping continue claude --dangerously-skip-permissions
   是否宣布续跑或已开始这一轮,只有没有时才输入续跑消息 —— 任务不会被续两次,旧版
   Claude Code 也照样能续上。
 - 诊断时间线写入 `~/.config/limitping/continue.log`(超过 1 MB 轮转为 `continue.log.1`)。
-- 目前仅支持 Unix(需要 PTY);在 Windows 上该命令会提示暂不支持。
+- 支持 Unix(PTY)和 Windows 10 1809+(ConPTY)。Windows 说明:
+  - Ctrl+Z 不会转发给 CLI(控制台把它当作输入结束,`continue` 会忽略它,键盘输入照常可用)。
+  - 关闭控制台窗口或按 Ctrl+Break 会立即强制结束 CLI 及其子进程,CLI 没有机会保存会话状态;
+    需要保存时请正常退出 CLI(如 `/exit`)。Ctrl+C 与 Unix 一样作为按键传给 CLI。
+  - 通过 npm 安装的 `claude`(`.cmd` 垫片)用于判断 Claude Code 是否已自行续跑的进程 ID
+    只能尽力识别;识别不了时 `continue` 仅依据屏幕提示和 90 秒宽限,偶尔可能在 Claude Code
+    已续跑的任务上重复输入续跑消息。
+  - 你自己的输入不会插进注入的消息中间,但注入前已在提示框里输入的文字不受保护。

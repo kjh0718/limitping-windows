@@ -32,5 +32,17 @@ limitping continue claude --dangerously-skip-permissions
   the task is never continued twice, and older Claude Code still gets resumed.
 - A diagnostic timeline is written to `~/.config/limitping/continue.log`
   (rotated to `continue.log.1` past 1 MB).
-- Unix only for now (needs a PTY); on Windows the command reports that it's
-  unsupported.
+- Works on Unix (PTY) and Windows 10 1809+ (ConPTY). Windows notes:
+  - Ctrl+Z is not forwarded to the CLI (the console reports it as end of input,
+    which `continue` ignores so typing keeps working).
+  - Closing the console window or pressing Ctrl+Break force-kills the CLI and
+    its child processes at once, so it gets no chance to save session state;
+    exit the CLI normally (e.g. `/exit`) when that matters. Ctrl+C reaches the
+    CLI as a keystroke, as on Unix.
+  - For an npm-installed `claude` (a `.cmd` shim) the process id used to detect
+    that Claude Code resumed by itself is looked up on a best-effort basis; when
+    it cannot be identified, `continue` relies on the on-screen message and the
+    90-second grace only, which can occasionally type the message on top of a
+    task Claude Code already resumed.
+  - Your own typing is not interleaved with an injected message, but text you
+    already typed into the prompt before the injection is not protected.

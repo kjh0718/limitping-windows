@@ -45,7 +45,7 @@ Want to look before it spends quota? `limitping ping --dry-run`.
 
 - ⏱️ **Back-to-back windows** — pings each provider right after reset, via the official CLI.
 - 🧠 **Never interrupts you** — CLI hooks detect an active session and let it start the window itself.
-- 🌙 **Auto-continue overnight tasks** — `limitping continue codex` types "continue" the moment the limit recovers (Unix only; it needs a PTY).
+- 🌙 **Auto-continue overnight tasks** — `limitping continue codex` types "continue" the moment the limit recovers (Unix and Windows; see [docs/continue.md](docs/continue.md) for the Windows limits).
 - 📊 **Real token & cost numbers** — today / week / month, from local session transcripts.
 - 🎟️ **Don't lose reset credits** — lists Codex reset credits and Claude reset cards; optional `auto_redeem` before expiry.
 - ⌨️ **Short to type** — every command works as `lmp` (`lmp s`, `lmp w`).

@@ -19,8 +19,9 @@ Each provider you enable needs its own credentials: the `claude` / `codex` CLIs
 logged in.
 
 **Windows** release archives are `.zip` only. `install.sh` does not run there,
-`limitping upgrade` will not replace a Windows binary, and `limitping continue`
-is Unix-only. See [Manual download](#manual-download).
+and `limitping upgrade` will not replace a Windows binary. `limitping continue`
+does run on Windows (see its [Windows notes](continue.md)). See
+[Manual download](#manual-download).
 
 <details>
 <summary>Upgrade</summary>
@@ -94,10 +95,9 @@ sudo mv limitping /usr/local/bin/
 
 Windows ships as `.zip` (`limitping_windows_amd64.zip`, `limitping_windows_arm64.zip`).
 That zip is a manual drop-in only: the install script rejects Windows,
-`limitping upgrade` tells you to download the zip yourself, and
-`limitping continue` reports that it is unsupported there because it needs a
-Unix PTY. `status`, `ping`, `watch`, `schedule`, and `bg` run from the unzipped
-binary: the Claude Code ping drives the interactive CLI through a native ConPTY
+`limitping upgrade` tells you to download the zip yourself. `status`, `ping`,
+`watch`, `schedule`, `bg`, and `continue` run from the unzipped binary: the
+Claude Code ping drives the interactive CLI through a native ConPTY
 pseudo-console, and the Codex ping runs `codex exec` headless. Both work with
 CLIs installed as `.cmd`/`.bat` shims (the usual npm install); an extra argument
 or prompt containing `%`, a NUL or a newline cannot be passed through a shim and
