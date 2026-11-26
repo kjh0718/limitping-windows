@@ -223,19 +223,37 @@ func prepareWindowsCommand(cmd *exec.Cmd) (appName, cmdLine string, err error) {
 // process's directory. The result is absolute in that case, so cmd.exe (whose own
 // directory is Dir) cannot resolve a batch script against Dir a second time.
 //
-// Only a plain relative path is joined. A rooted one (a leading \ or /) or one
-// with a drive but no root (C:probe.cmd) is not "relative to Dir" in a way a
-// join can express, so it is left as given.
+// Forms follow syscall.joinExeDirAndFName, which os/exec's own start uses:
+//   - plain relative (`probe.cmd`, `.\x\probe.cmd`): joined with Dir;
+//   - rooted without a drive (`\x`, `/x`): Dir's volume is put in front of it;
+//   - a drive without a root (`C:probe.cmd`): joined with Dir when Dir is on the
+//     same drive (case-insensitive), otherwise left as given;
+//   - absolute and UNC paths: left as given.
 func executablePath(cmd *exec.Cmd) string {
-	p := cmd.Path
-	if cmd.Dir == "" || p == "" || filepath.IsAbs(p) || os.IsPathSeparator(p[0]) || filepath.VolumeName(p) != "" {
+	p, dir := cmd.Path, cmd.Dir
+	if dir == "" || p == "" || filepath.IsAbs(p) {
 		return p
 	}
-	joined := filepath.Join(cmd.Dir, p)
-	if abs, err := filepath.Abs(joined); err == nil {
-		return abs
+	abs := func(s string) string {
+		if a, err := filepath.Abs(s); err == nil {
+			return a
+		}
+		return s
 	}
-	return joined
+	dirVol := filepath.VolumeName(dir)
+	if vol := filepath.VolumeName(p); vol != "" {
+		if rest := p[len(vol):]; rest != "" && strings.EqualFold(vol, dirVol) {
+			return abs(filepath.Join(dir, rest))
+		}
+		return p
+	}
+	if os.IsPathSeparator(p[0]) {
+		if dirVol == "" {
+			return p
+		}
+		return filepath.Clean(dirVol + p)
+	}
+	return abs(filepath.Join(dir, p))
 }
 
 // batchCommand builds the interpreter invocation that runs a .cmd/.bat script.

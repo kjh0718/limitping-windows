@@ -1191,19 +1191,29 @@ func TestRelativeNativePathIsResolvedAgainstDir(t *testing.T) {
 	}
 }
 
+// The expected forms follow syscall.joinExeDirAndFName (what os/exec itself uses).
 func TestExecutablePath(t *testing.T) {
-	dir := t.TempDir()
+	const dir = `C:\work\proj`
+	const unc = `\\host\share\proj`
 	cases := []struct{ name, path, dir, want string }{
 		{"absolute", `C:\tools\probe.cmd`, dir, `C:\tools\probe.cmd`},
-		{"rooted backslash", `\tools\probe.cmd`, dir, `\tools\probe.cmd`},
-		{"rooted slash", `/tools/probe.cmd`, dir, `/tools/probe.cmd`},
-		{"drive relative", `C:probe.cmd`, dir, `C:probe.cmd`},
-		{"unc", `\\host\share\probe.cmd`, dir, `\\host\share\probe.cmd`},
+		{"absolute other drive", `D:\tools\probe.cmd`, dir, `D:\tools\probe.cmd`},
+		{"unc path", `\\host\share\probe.cmd`, dir, `\\host\share\probe.cmd`},
 		{"no dir", `.\probe.cmd`, "", `.\probe.cmd`},
 		{"empty path", ``, dir, ``},
-		{"dot relative", `.\probe.cmd`, dir, filepath.Join(dir, "probe.cmd")},
-		{"sub relative", `sub\probe.cmd`, dir, filepath.Join(dir, "sub", "probe.cmd")},
-		{"parent relative", `..\probe.cmd`, filepath.Join(dir, "sub"), filepath.Join(dir, "probe.cmd")},
+		{"dot relative", `.\probe.cmd`, dir, `C:\work\proj\probe.cmd`},
+		{"sub relative", `sub\probe.cmd`, dir, `C:\work\proj\sub\probe.cmd`},
+		{"parent relative", `..\probe.cmd`, dir, `C:\work\probe.cmd`},
+		{"relative in unc dir", `probe.cmd`, unc, `\\host\share\proj\probe.cmd`},
+		{"rooted backslash gets dir drive", `\tools\probe.cmd`, dir, `C:\tools\probe.cmd`},
+		{"rooted slash gets dir drive", `/tools/probe.cmd`, dir, `C:\tools\probe.cmd`},
+		{"rooted in unc dir gets share", `\tools\probe.cmd`, unc, `\\host\share\tools\probe.cmd`},
+		{"rooted with drive-less dir", `\tools\probe.cmd`, `proj`, `\tools\probe.cmd`},
+		{"drive relative same drive", `C:probe.cmd`, dir, `C:\work\proj\probe.cmd`},
+		{"drive relative same drive other case", `c:sub\probe.cmd`, dir, `C:\work\proj\sub\probe.cmd`},
+		{"drive relative other drive", `D:probe.cmd`, dir, `D:probe.cmd`},
+		{"drive relative with unc dir", `C:probe.cmd`, unc, `C:probe.cmd`},
+		{"bare drive", `C:`, dir, `C:`},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
